@@ -1,6 +1,7 @@
 # Binance 交割合约示例项目
 
 本项目演示了如何使用 Python 调用币安交割合约下单接口（`POST /fapi/v1/order`），并对代码进行模块化拆分，便于后续拓展更多接口。
+https://developers.binance.com/docs/zh-CN/derivatives/usds-margined-futures/general-info
 
 ## 目录结构
 

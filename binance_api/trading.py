@@ -476,29 +476,23 @@ selfTradePreventionMode 仅在 timeInForce为IOC或GTC或GTD时生效.
     def get_position_risk(
         self,
         *,
-        margin_asset: Optional[str] = None,
-        pair: Optional[str] = None,
+        symbol: Optional[str] = None,
         recv_window: Optional[int] = None,
     ) -> Any:
         """
-        查询用户持仓风险 (USER_DATA)，对应 GET /fapi/v1/positionRisk，权重 1。
-
-        - `marginAsset` 与 `pair` 不可同时提供；均为空时返回所有上市/结算中 symbol。
-        - 双向持仓会返回 BOTH/LONG/SHORT 三个方向；单向持仓仅返回 BOTH。
+        查询持仓风险 (USER_DATA)，对应 GET /fapi/v3/positionRisk 或 /dapi/v3/positionRisk。
 
         Args:
-            margin_asset: 保证金币种过滤。
-            pair: 标的交易对过滤。
+            symbol: 交易对过滤，仅返回指定合约的风险信息。
             recv_window: 收敛窗口。
         """
 
-        if margin_asset and pair:
-            raise ValueError("margin_asset 与 pair 不可同时提供。")
-
-        params = {"marginAsset": margin_asset, "pair": pair}
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
         return self.client.signed_request(
             "GET",
-            f"{self.version_prefix}/positionRisk",
+            self._position_risk_endpoint(),
             params=params,
             recv_window=recv_window,
         )
@@ -541,3 +535,8 @@ selfTradePreventionMode 仅在 timeInForce为IOC或GTC或GTD时生效.
             params=params,
             recv_window=recv_window,
         )
+
+    def _position_risk_endpoint(self) -> str:
+        if self.version_prefix.endswith("/v1"):
+            return f"{self.version_prefix[:-3]}/v3/positionRisk"
+        return f"{self.version_prefix}/positionRisk"

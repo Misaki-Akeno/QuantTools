@@ -203,12 +203,50 @@ def _categorize_existing_orders(
     return grid_orders, tp_orders, sl_orders
 
 
+def _fetch_margin_usage(
+    trading: BinanceDeliveryTrading,
+    symbol: str,
+) -> Tuple[Optional[Decimal], Optional[str]]:
+    try:
+        positions = trading.get_position_risk(symbol=symbol)
+    except Exception as exc:
+        return None, str(exc)
+
+    if not isinstance(positions, Sequence):
+        return None, "positionRisk 返回结果格式异常"
+
+    total = Decimal("0")
+    matched = False
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        if item.get("symbol") != symbol:
+            continue
+        matched = True
+        for field in ("positionInitialMargin", "openOrderInitialMargin"):
+            raw_value = item.get(field)
+            if raw_value in (None, ""):
+                continue
+            try:
+                total += abs(Decimal(str(raw_value)))
+            except (InvalidOperation, ValueError):
+                return None, f"无法解析 {field}: {raw_value}"
+
+    if not matched:
+        return Decimal("0"), None
+    return total, None
+
+
 def _echo_runtime_status(
     *,
     current_price: Decimal,
     existing_orders: Sequence[dict[str, Any]],
     new_orders: Sequence[ExecutionResult],
     pnl_report: Optional[PnLReport],
+    margin_usage: Optional[Decimal],
+    margin_limit: Optional[Decimal],
+    margin_exceeded: bool,
+    margin_error: Optional[str],
 ) -> None:
     typer.echo("=== 实时状态 ===")
     typer.echo(f"当前价格: {_format_decimal(current_price)}")
@@ -218,6 +256,19 @@ def _echo_runtime_status(
     _echo_open_orders("止损挂单", sl_orders, protective=True)
     _echo_new_orders(new_orders)
     _echo_pnl(pnl_report)
+    typer.echo("=== 保证金 ===")
+    if margin_error:
+        typer.echo(f"  获取失败: {margin_error}")
+        return
+    limit_text = _format_decimal(margin_limit) if margin_limit is not None else "?"
+    if margin_usage is None:
+        typer.echo(f"  当前占用: 未知 (阈值: {limit_text})")
+        return
+    typer.echo(
+        f"  当前占用: {_format_decimal(margin_usage, 6)} (阈值: {limit_text})"
+    )
+    if margin_exceeded:
+        typer.echo("  警告: 占用已超过阈值，暂停开仓。")
 
 
 def _format_ts(ts_ms: int) -> str:
@@ -243,7 +294,7 @@ def grid_trader(
     long_interval: str = typer.Option("1d", help="长期趋势使用的 K 线周期"),
     long_limit: int = typer.Option(240, help="长期趋势使用的 K 线条数"),
     short_interval: str = typer.Option("15m", help="网格上下限使用的 K 线周期"),
-    short_limit: int = typer.Option(36, help="短周期 K 线条数，用于确定网格边界"),
+    short_limit: int = typer.Option(60, help="短周期 K 线条数，用于确定网格边界"),
     market: str = typer.Option(
         "usdt",
         "--market",
@@ -267,7 +318,12 @@ def grid_trader(
         help="双向持仓模式下的 positionSide，可选 LONG/SHORT/BOTH。",
     ),
     reduce_only: bool = typer.Option(False, help="是否只允许减仓订单。"),
-    time_in_force: str = typer.Option("GTC", help="限价单 timeInForce。"),
+    time_in_force: str = typer.Option("GTD", help="限价单 timeInForce。"),
+    gtd_seconds: Optional[int] = typer.Option(
+        1200,
+        "--gtd-seconds",
+        help="timeInForce=GTD 时订单自动取消时间（秒），需 >= 600，未指定时默认 3600 秒。",
+    ),
     take_profit_pct: str = typer.Option(
         "0.001",
         "--take-profit-pct",
@@ -330,6 +386,21 @@ def grid_trader(
         typer.echo("stop-loss-pct 需大于 0。")
         raise typer.Exit(code=1)
 
+    time_in_force = time_in_force.upper()
+    gtd_seconds_value: Optional[int] = gtd_seconds
+    if time_in_force == "GTD":
+        if gtd_seconds_value is None:
+            gtd_seconds_value = 3600
+        if gtd_seconds_value < 600:
+            typer.echo("timeInForce=GTD 时，--gtd-seconds 需至少 600 秒。")
+            raise typer.Exit(code=1)
+        max_gtd_ms = 253402300799000
+        if (int(time.time()) + gtd_seconds_value) * 1000 >= max_gtd_ms:
+            typer.echo("--gtd-seconds 超出 Binance 限制。")
+            raise typer.Exit(code=1)
+    else:
+        gtd_seconds_value = None
+
     pnl_start_time_ms = SCRIPT_START_TIME_MS
     if pnl_start_time:
         pnl_start_time_ms = _parse_utc_timestamp(pnl_start_time, "pnl-start-time")
@@ -356,6 +427,11 @@ def grid_trader(
         except Exception as exc:
             typer.echo(f"设置杠杆失败: {exc}")
             raise typer.Exit(code=1)
+        try:
+            typer.echo(f"撤销 {symbol} 的全部挂单 ...")
+            trading.cancel_all_orders(symbol=symbol)
+        except Exception as exc:
+            typer.echo(f"撤销挂单失败: {exc}")
     bot = GridBot(market_data, trading)
 
     config = GridConfig(
@@ -376,31 +452,57 @@ def grid_trader(
         reduce_only=reduce_only,
         take_profit_pct=take_profit_decimal,
         stop_loss_pct=stop_loss_decimal,
+        gtd_seconds=gtd_seconds_value,
     )
 
     cycles = 0
     plan_printed = False
+    max_run_retries = 3
+    retry_delay_seconds = 5.0
     while True:
-        effective_config = config if not continuous else replace(config, place_orders=False)
-        try:
-            plan, executions = bot.run(effective_config)
-        except Exception as exc:
-            typer.echo(f"网格生成失败: {exc}")
-            raise typer.Exit(code=1) from exc
+        effective_config = replace(config, place_orders=False)
+        plan: Optional[GridPlan] = None
+        executions: List[ExecutionResult] = []
+        for attempt in range(1, max_run_retries + 1):
+            try:
+                plan, executions = bot.run(effective_config)
+                break
+            except Exception as exc:
+                typer.echo(f"网格生成失败 (第 {attempt} 次): {exc}")
+                if attempt >= max_run_retries:
+                    if not continuous:
+                        typer.echo("重试仍失败，退出。")
+                        raise typer.Exit(code=1) from exc
+                    typer.echo("达到重试上限，等待后继续...")
+                time.sleep(retry_delay_seconds * attempt)
+        if plan is None:
+            continue
 
         if not plan_printed:
             _echo_plan(plan)
             plan_printed = True
 
+        margin_usage: Optional[Decimal] = None
+        margin_error: Optional[str] = None
+        margin_exceeded = False
+        margin_limit: Optional[Decimal] = config.total_investment
+
+        if trading:
+            margin_usage, margin_error = _fetch_margin_usage(trading, config.symbol)
+            if margin_error is None and margin_usage is not None and margin_limit is not None:
+                if margin_usage > margin_limit:
+                    margin_exceeded = True
+
         existing_orders: Sequence[dict[str, Any]] = []
-        new_orders: Sequence[ExecutionResult] = []
+        new_orders: Sequence[ExecutionResult] = list(executions)
         pnl_report: Optional[PnLReport] = None
 
         if place_orders and trading:
-            if continuous:
-                new_orders = bot.sync_orders(plan, config)
+            if margin_exceeded:
+                typer.echo("保证金占用超过总投入，跳过补单。")
+                new_orders = []
             else:
-                new_orders = executions
+                new_orders = bot.sync_orders(plan, config)
             try:
                 existing_orders = trading.get_open_orders(symbol=config.symbol)
             except Exception as exc:
@@ -413,6 +515,13 @@ def grid_trader(
                 )
             except Exception as exc:
                 typer.echo(f"盈亏统计失败: {exc}")
+            updated_usage, updated_error = _fetch_margin_usage(trading, config.symbol)
+            if updated_error:
+                margin_error = updated_error
+            elif updated_usage is not None:
+                margin_usage = updated_usage
+                if margin_limit is not None and margin_usage > margin_limit:
+                    margin_exceeded = True
         else:
             new_orders = executions
 
@@ -421,6 +530,10 @@ def grid_trader(
             existing_orders=existing_orders,
             new_orders=new_orders,
             pnl_report=pnl_report,
+            margin_usage=margin_usage,
+            margin_limit=margin_limit,
+            margin_exceeded=margin_exceeded,
+            margin_error=margin_error,
         )
 
         cycles += 1

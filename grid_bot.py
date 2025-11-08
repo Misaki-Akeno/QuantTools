@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -81,6 +82,7 @@ class GridConfig:
     reduce_only: bool = False
     take_profit_pct: Decimal = Decimal("0.01")
     stop_loss_pct: Decimal = Decimal("0.01")
+    gtd_seconds: Optional[int] = None
 
 
 @dataclass
@@ -99,6 +101,14 @@ class PnLReport:
     end_time: Optional[int]
 
 
+@dataclass
+class _KlinesCacheEntry:
+    data: Sequence[Sequence[Any]]
+    start_time: Optional[int]
+    end_time: Optional[int]
+    fetched_at: float
+
+
 class GridBot:
     """基于 K 线数据的自动网格策略。"""
 
@@ -111,9 +121,11 @@ class GridBot:
         self.trading = trading
         self._klines_cache: OrderedDict[
             Tuple[str, str, Optional[int], Optional[int], MarketType, int],
-            Sequence[Sequence[Any]],
+            _KlinesCacheEntry,
         ] = OrderedDict()
         self._klines_cache_size = 16
+        self._klines_cache_ttl = 2.0
+        self._default_gtd_seconds = 3600
 
     def run(self, config: GridConfig) -> Tuple[GridPlan, List[ExecutionResult]]:
         if config.grid_count < 2:
@@ -136,7 +148,10 @@ class GridBot:
 
         trend = self._detect_trend(long_klines)
         lower_bound, upper_bound = self._derive_bounds(short_klines, trend)
-        current_price = self._extract_price(short_klines[-1][4])
+        try:
+            current_price = self._fetch_current_price(config.symbol, config.market)
+        except Exception:
+            current_price = self._extract_price(short_klines[-1][4])
 
         symbol_filters = self._get_symbol_filters(
             symbol=config.symbol,
@@ -177,9 +192,10 @@ class GridBot:
         end_time: Optional[int] = None,
     ) -> Sequence[Sequence[Any]]:
         cache_key = (symbol, interval, start_time, end_time, market, limit)
-        if cache_key in self._klines_cache:
+        cache_entry = self._klines_cache.get(cache_key)
+        if cache_entry and self._cache_entry_valid(cache_entry, start_time, end_time):
             self._klines_cache.move_to_end(cache_key)
-            return self._klines_cache[cache_key]
+            return cache_entry.data
 
         klines = self.market_data.get_klines(
             symbol=symbol,
@@ -192,10 +208,55 @@ class GridBot:
         if not isinstance(klines, Sequence) or len(klines) < 2:
             raise ValueError(f"{interval} 周期返回的数据不足以计算趋势/网格。")
         normalized = tuple(tuple(item) for item in klines)
-        self._klines_cache[cache_key] = normalized
+        cache_entry = _KlinesCacheEntry(
+            data=normalized,
+            start_time=self._extract_kline_start(normalized),
+            end_time=self._extract_kline_end(normalized),
+            fetched_at=time.time(),
+        )
+        self._klines_cache[cache_key] = cache_entry
         if len(self._klines_cache) > self._klines_cache_size:
             self._klines_cache.popitem(last=False)
-        return normalized
+        return cache_entry.data
+
+    def _cache_entry_valid(
+        self,
+        entry: _KlinesCacheEntry,
+        start_time: Optional[int],
+        end_time: Optional[int],
+    ) -> bool:
+        if start_time is not None:
+            if entry.start_time is None or entry.start_time > start_time:
+                return False
+        if end_time is not None:
+            if entry.end_time is None or entry.end_time < end_time:
+                return False
+        if start_time is None and end_time is None:
+            if (time.time() - entry.fetched_at) > self._klines_cache_ttl:
+                return False
+        return True
+
+    def _extract_kline_start(self, klines: Sequence[Sequence[Any]]) -> Optional[int]:
+        if not klines:
+            return None
+        first = klines[0]
+        if len(first) < 1:
+            return None
+        try:
+            return int(first[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_kline_end(self, klines: Sequence[Sequence[Any]]) -> Optional[int]:
+        if not klines:
+            return None
+        last = klines[-1]
+        if len(last) < 7:
+            return None
+        try:
+            return int(last[6])
+        except (TypeError, ValueError):
+            return None
 
     def _detect_trend(self, klines: Sequence[Sequence[Any]]) -> TrendSignal:
         closes = [self._extract_price(item[4]) for item in klines if len(item) > 4]
@@ -449,13 +510,30 @@ class GridBot:
         return PnLReport(total=total, trade_count=len(trades), start_time=start_ts, end_time=end_ts)
 
     def _submit_levels(self, levels: Sequence[GridLevel], config: GridConfig) -> List[ExecutionResult]:
-        executions: List[ExecutionResult] = []
-        for level in levels:
+        filtered_levels, skipped_results = self._filter_cross_book(levels, config)
+        executions: List[ExecutionResult] = list(skipped_results)
+        gtd_expiration_ms: Optional[int] = None
+        for level in filtered_levels:
             order_type = getattr(level, "order_type", "LIMIT").upper()
             is_limit = order_type == "LIMIT"
             price = level.price if is_limit else None
             stop_price = level.stop_price if level.stop_price is not None else (None if is_limit else level.price)
             tif = config.time_in_force if is_limit else None
+            extra_params: dict[str, Any] = {}
+            if tif and tif.upper() == "GTD":
+                if gtd_expiration_ms is None:
+                    try:
+                        gtd_expiration_ms = self._compute_good_till_date(config)
+                    except ValueError as exc:
+                        executions.append(
+                            ExecutionResult(
+                                level=level,
+                                success=False,
+                                error=str(exc),
+                            )
+                        )
+                        continue
+                extra_params["goodTillDate"] = gtd_expiration_ms
             order = OrderRequest(
                 symbol=config.symbol,
                 side=level.side,
@@ -466,6 +544,7 @@ class GridBot:
                 time_in_force=tif,
                 position_side=config.position_side,
                 reduce_only=config.reduce_only,
+                extra_params=extra_params,
             )
             try:
                 response = self.trading.create_order(order)  # type: ignore[union-attr]
@@ -480,14 +559,85 @@ class GridBot:
                 )
         return executions
 
+    def _compute_good_till_date(self, config: GridConfig) -> int:
+        seconds_value = config.gtd_seconds if config.gtd_seconds is not None else self._default_gtd_seconds
+        seconds = int(seconds_value)
+        if seconds < 600:
+            seconds = 600
+        now_seconds = int(time.time())
+        expiry_seconds = now_seconds + seconds
+        max_ms = 253402300799000
+        expiry_ms = expiry_seconds * 1000
+        if expiry_ms >= max_ms:
+            raise ValueError("goodTillDate 超出 Binance 限制。")
+        return expiry_ms
+
+    def _filter_cross_book(
+        self,
+        levels: Sequence[GridLevel],
+        config: GridConfig,
+    ) -> Tuple[List[GridLevel], List[ExecutionResult]]:
+        if not levels:
+            return [], []
+        try:
+            book_ticker = self.market_data.get_book_ticker(
+                symbol=config.symbol,
+                market=config.market,
+            )
+        except Exception:
+            return list(levels), []
+
+        if not isinstance(book_ticker, dict):
+            return list(levels), []
+
+        best_bid = self._extract_optional_price(book_ticker.get("bidPrice"))
+        best_ask = self._extract_optional_price(book_ticker.get("askPrice"))
+
+        filtered: List[GridLevel] = []
+        skipped: List[ExecutionResult] = []
+        for level in levels:
+            order_type = getattr(level, "order_type", "LIMIT").upper()
+            side = level.side.upper()
+            if order_type != "LIMIT":
+                filtered.append(level)
+                continue
+            if side == "BUY" and best_ask is not None and level.price >= best_ask:
+                skipped.append(
+                    ExecutionResult(
+                        level=level,
+                        success=False,
+                        error=(
+                            "跳过补单：买单价格不应高于当前最优卖价"
+                            f"（price={level.price} >= ask={best_ask}）"
+                        ),
+                    )
+                )
+                continue
+            if side == "SELL" and best_bid is not None and level.price <= best_bid:
+                skipped.append(
+                    ExecutionResult(
+                        level=level,
+                        success=False,
+                        error=(
+                            "跳过补单：卖单价格不应低于当前最优买价"
+                            f"（price={level.price} <= bid={best_bid}）"
+                        ),
+                    )
+                )
+                continue
+            filtered.append(level)
+        return filtered, skipped
+
     def _select_active_levels(self, plan: GridPlan) -> List[GridLevel]:
         active: List[GridLevel] = []
+        # 选择最近的2个买入级别（价格最高的2个）
         if plan.buy_levels:
-            nearest_buy = max(plan.buy_levels, key=lambda level: level.price)
-            active.append(nearest_buy)
+            sorted_buy = sorted(plan.buy_levels, key=lambda level: level.price, reverse=True)
+            active.extend(sorted_buy[:2])
+        # 选择最近的2个卖出级别（价格最低的2个）
         if plan.sell_levels:
-            nearest_sell = min(plan.sell_levels, key=lambda level: level.price)
-            active.append(nearest_sell)
+            sorted_sell = sorted(plan.sell_levels, key=lambda level: level.price)
+            active.extend(sorted_sell[:2])
         if plan.take_profit:
             active.append(plan.take_profit)
         if plan.stop_loss:
@@ -609,6 +759,23 @@ class GridBot:
         if value in (None, "", 0, "0", "0.0", "0.00"):
             return None
         return self._extract_price(value)
+
+    def _fetch_current_price(self, symbol: str, market: MarketType) -> Decimal:
+        ticker = self.market_data.get_price_ticker(symbol=symbol, market=market)
+        target: Optional[dict[str, Any]] = None
+        if isinstance(ticker, dict):
+            target = ticker
+        elif isinstance(ticker, (list, tuple)):
+            for item in ticker:
+                if isinstance(item, dict) and item.get("symbol") == symbol:
+                    target = item
+                    break
+        if not target:
+            raise ValueError("未能获取价格ticker。")
+        price_value = target.get("price") or target.get("lastPrice") or target.get("markPrice")
+        if price_value is None:
+            raise ValueError("价格ticker缺少 price 字段。")
+        return self._extract_price(price_value)
 
     def _parse_decimal(self, value: Any, *, field: str) -> Decimal:
         try:
