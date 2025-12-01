@@ -7,12 +7,11 @@ from urllib.parse import urlencode
 import requests
 from dotenv import load_dotenv
 
-from .exceptions import BinanceAPIError
-from .utils import drop_none, stringify
+from .utils import BinanceAPIError, drop_none, stringify
 
 
 class BinanceClient:
-    """轻量级的币安交割合约 HTTP 客户端，负责签名与请求发送。"""
+    """轻量级的币安 U 本位合约 HTTP 客户端，负责签名与请求发送。"""
 
     def __init__(
         self,
@@ -99,14 +98,28 @@ class BinanceClient:
         formatted_params = {k: stringify(v) for k, v in drop_none(params_dict).items()}
         query_string = urlencode(formatted_params, doseq=True)
         signature = self._sign(query_string)
-        signed_params = {**formatted_params, "signature": signature}
-        return self._request(method, path, params=signed_params)
+        
+        # 手动拼接 signature 确保其在最后，符合 Binance 接口要求
+        if query_string:
+            full_query = f"{query_string}&signature={signature}"
+        else:
+            full_query = f"signature={signature}"
+            
+        # 将拼接好的 query string 直接附加到 path，避免 requests 重新排序或编码
+        return self._request(method, f"{path}?{full_query}", params=None)
 
-def build_client_from_env() -> BinanceClient:
+def build_client_from_env(prod: bool = False) -> BinanceClient:
     load_dotenv(".env.local")
-    api_key = os.getenv("API_KEY", "")
-    api_secret = os.getenv("SECRET_KEY", "")
-    base_url = os.getenv("BASE_URL_TEST", "")
+    if prod:
+        api_key = os.getenv("API_KEY_PROD", "")
+        api_secret = os.getenv("SECRET_KEY_PROD", "")
+        base_url = os.getenv("BASE_URL_PROD", "https://fapi.binance.com")
+    else:
+        api_key = os.getenv("API_KEY", "")
+        api_secret = os.getenv("SECRET_KEY", "")
+        base_url = os.getenv("BASE_URL_TEST", "")
+
     if not all([api_key, api_secret, base_url]):
-        raise RuntimeError("缺少 API Key、Secret 或 Base URL，请检查 .env.local 配置。")
+        env_name = "生产" if prod else "测试"
+        raise RuntimeError(f"缺少 {env_name} 环境的 API Key、Secret 或 Base URL，请检查 .env.local 配置。")
     return BinanceClient(api_key, api_secret, base_url)

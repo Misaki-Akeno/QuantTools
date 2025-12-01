@@ -1,6 +1,13 @@
 from decimal import Decimal
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
+class BinanceAPIError(Exception):
+    """APIW错误响应包装。"""
+
+    def __init__(self, status_code: int, message: str, payload: Optional[Any] = None) -> None:
+        super().__init__(f"HTTP {status_code}: {message}")
+        self.status_code = status_code
+        self.payload = payload
 
 def stringify(value: Any) -> str:
     if isinstance(value, bool):

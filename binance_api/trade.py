@@ -1,12 +1,111 @@
 import json
-from typing import Any, Dict, Optional, Sequence
+from dataclasses import asdict, dataclass, field
+from decimal import Decimal
+from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence
 
 from .client import BinanceClient
-from .orders import OrderRequest
+from .utils import stringify
 
 
-class BinanceDeliveryTrading:
-    """交割合约交易接口封装。"""
+@dataclass
+class OrderRequest:
+    """U 本位合约 /fapi/v1/order 请求构造器与校验器。"""
+
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Optional[Decimal] = None
+    price: Optional[Decimal] = None
+    position_side: Optional[str] = None
+    reduce_only: Optional[bool] = None
+    new_client_order_id: Optional[str] = None
+    stop_price: Optional[Decimal] = None
+    close_position: Optional[bool] = None
+    activation_price: Optional[Decimal] = None
+    callback_rate: Optional[Decimal] = None
+    time_in_force: Optional[str] = None
+    working_type: Optional[str] = None
+    price_protect: Optional[bool] = None
+    new_order_resp_type: Optional[str] = None
+    price_match: Optional[str] = None
+    self_trade_prevention_mode: Optional[str] = None
+    recv_window: Optional[int] = 5000
+    extra_params: Dict[str, Any] = field(default_factory=dict)
+
+    _ATTR_TO_PARAM: ClassVar[Mapping[str, str]] = {
+        "order_type": "type",
+        "position_side": "positionSide",
+        "reduce_only": "reduceOnly",
+        "new_client_order_id": "newClientOrderId",
+        "stop_price": "stopPrice",
+        "close_position": "closePosition",
+        "activation_price": "activationPrice",
+        "callback_rate": "callbackRate",
+        "time_in_force": "timeInForce",
+        "working_type": "workingType",
+        "price_protect": "priceProtect",
+        "new_order_resp_type": "newOrderRespType",
+        "price_match": "priceMatch",
+        "self_trade_prevention_mode": "selfTradePreventionMode",
+        "recv_window": "recvWindow",
+    }
+
+    _REQUIRED_BY_TYPE: ClassVar[Mapping[str, set[str]]] = {
+        "LIMIT": {"quantity", "price", "timeInForce"},
+        "MARKET": {"quantity"},
+        "STOP": {"quantity", "price", "stopPrice"},
+        "TAKE_PROFIT": {"quantity", "price", "stopPrice"},
+        "STOP_MARKET": {"stopPrice"},
+        "TAKE_PROFIT_MARKET": {"stopPrice"},
+        "TRAILING_STOP_MARKET": {"callbackRate"},
+    }
+
+    _BOOLEAN_OVERRIDES: ClassVar[Mapping[str, Any]] = {
+        "reduceOnly": lambda value: "true" if value else "false",
+        "closePosition": lambda value: "true" if value else "false",
+        "priceProtect": lambda value: "TRUE" if value else "FALSE",
+    }
+
+    def validate(self) -> None:
+        order_type_key = self.order_type.upper()
+        required_params = self._REQUIRED_BY_TYPE.get(order_type_key, set())
+        provided_params = self._gather_params()
+        missing = [param for param in required_params if param not in provided_params]
+        if missing:
+            raise ValueError(f"订单类型 {order_type_key} 需要参数: {', '.join(missing)}")
+
+        if self.close_position and self.quantity is not None:
+            raise ValueError("closePosition 与 quantity 不能同时使用。")
+        if self.close_position and self.reduce_only:
+            raise ValueError("closePosition 已隐含 reduceOnly，无需重复设置。")
+        if self.price and self.price_match:
+            raise ValueError("priceMatch 不可与 price 同时提交。")
+
+    def _gather_params(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        for attr, value in asdict(self, dict_factory=dict).items():
+            if attr in {"extra_params"}:
+                continue
+            if value is None:
+                continue
+            param_name = self._ATTR_TO_PARAM.get(attr, attr)
+            payload[param_name] = value
+        payload.update(self.extra_params)
+        return payload
+
+    def to_params(self) -> Dict[str, Any]:
+        self.validate()
+        params: Dict[str, Any] = {}
+        for key, value in self._gather_params().items():
+            if key in self._BOOLEAN_OVERRIDES:
+                params[key] = self._BOOLEAN_OVERRIDES[key](value)
+            else:
+                params[key] = stringify(value)
+        return params
+
+
+class BinanceTrading:
+    """U 本位合约交易接口封装。"""
 
     def __init__(self, client: BinanceClient, *, version_prefix: str = "/fapi/v1") -> None:
         self.client = client
@@ -41,107 +140,6 @@ class BinanceDeliveryTrading:
     def create_order(self, order: OrderRequest, *, recv_window: Optional[int] = None) -> Any:
         """
         下单 (TRADE)，对应 POST /fapi/v1/order，权重 1。
-
-HTTP请求
-POST /fapi/v1/order
-
-请求权重
-10s order rate limit(X-MBX-ORDER-COUNT-10S)为1; 1min order rate limit(X-MBX-ORDER-COUNT-1M)为1; IP rate limit(x-mbx-used-weight-1m)为0
-
-请求参数
-名称	类型	是否必需	描述
-symbol	STRING	YES	交易对
-side	ENUM	YES	买卖方向 SELL, BUY
-positionSide	ENUM	NO	持仓方向，单向持仓模式下非必填，默认且仅可填BOTH;在双向持仓模式下必填,且仅可选择 LONG 或 SHORT
-type	ENUM	YES	订单类型 LIMIT, MARKET, STOP, TAKE_PROFIT, STOP_MARKET, TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET
-reduceOnly	STRING	NO	true, false; 非双开模式下默认false；双开模式下不接受此参数； 使用closePosition不支持此参数。
-quantity	DECIMAL	NO	下单数量,使用closePosition不支持此参数。
-price	DECIMAL	NO	委托价格
-newClientOrderId	STRING	NO	用户自定义的订单号，不可以重复出现在挂单中。如空缺系统会自动赋值。必须满足正则规则 ^[\.A-Z\:/a-z0-9_-]{1,36}$
-stopPrice	DECIMAL	NO	触发价, 仅 STOP, STOP_MARKET, TAKE_PROFIT, TAKE_PROFIT_MARKET 需要此参数
-closePosition	STRING	NO	true, false；触发后全部平仓，仅支持STOP_MARKET和TAKE_PROFIT_MARKET；不与quantity合用；自带只平仓效果，不与reduceOnly 合用
-activationPrice	DECIMAL	NO	追踪止损激活价格，仅TRAILING_STOP_MARKET 需要此参数, 默认为下单当前市场价格(支持不同workingType)
-callbackRate	DECIMAL	NO	追踪止损回调比例，可取值范围[0.1, 10],其中 1代表1% ,仅TRAILING_STOP_MARKET 需要此参数
-timeInForce	ENUM	NO	有效方法
-workingType	ENUM	NO	stopPrice 触发类型: MARK_PRICE(标记价格), CONTRACT_PRICE(合约最新价). 默认 CONTRACT_PRICE
-priceProtect	STRING	NO	条件单触发保护："TRUE","FALSE", 默认"FALSE". 仅 STOP, STOP_MARKET, TAKE_PROFIT, TAKE_PROFIT_MARKET 需要此参数
-newOrderRespType	ENUM	NO	"ACK", "RESULT", 默认 "ACK"
-priceMatch	ENUM	NO	OPPONENT/ OPPONENT_5/ OPPONENT_10/ OPPONENT_20/QUEUE/ QUEUE_5/ QUEUE_10/ QUEUE_20；不能与price同时传
-selfTradePreventionMode	ENUM	NO	EXPIRE_TAKER/ EXPIRE_MAKER/ EXPIRE_BOTH； 默认NONE
-goodTillDate	LONG	NO	TIF为GTD时订单的自动取消时间， 当timeInforce为GTD时必传；传入的时间戳仅保留秒级精度，毫秒级部分会被自动忽略，时间戳需大于当前时间+600s且小于253402300799000
-recvWindow	LONG	NO	
-timestamp	LONG	YES	
-根据 order type的不同，某些参数强制要求，具体如下:
-
-Type	强制要求的参数
-LIMIT	timeInForce, quantity, price
-MARKET	quantity
-STOP, TAKE_PROFIT	quantity, price, stopPrice
-STOP_MARKET, TAKE_PROFIT_MARKET	stopPrice
-TRAILING_STOP_MARKET	callbackRate
-条件单的触发必须:
-
-如果订单参数priceProtect为true:
-达到触发价时，MARK_PRICE(标记价格)与CONTRACT_PRICE(合约最新价)之间的价差不能超过改symbol触发保护阈值
-触发保护阈值请参考接口GET /fapi/v1/exchangeInfo 返回内容相应symbol中"triggerProtect"字段
-STOP, STOP_MARKET 止损单:
-买入: 最新合约价格/标记价格高于等于触发价stopPrice
-卖出: 最新合约价格/标记价格低于等于触发价stopPrice
-TAKE_PROFIT, TAKE_PROFIT_MARKET 止盈单:
-买入: 最新合约价格/标记价格低于等于触发价stopPrice
-卖出: 最新合约价格/标记价格高于等于触发价stopPrice
-TRAILING_STOP_MARKET 跟踪止损单:
-买入: 当合约价格/标记价格区间最低价格低于激活价格activationPrice,且最新合约价格/标记价高于等于最低价设定回调幅度。
-卖出: 当合约价格/标记价格区间最高价格高于激活价格activationPrice,且最新合约价格/标记价低于等于最高价设定回调幅度。
-TRAILING_STOP_MARKET 跟踪止损单如果遇到报错 {"code": -2021, "msg": "Order would immediately trigger."}
-表示订单不满足以下条件:
-
-买入: 指定的activationPrice 必须小于 latest price
-卖出: 指定的activationPrice 必须大于 latest price
-newOrderRespType 如果传 RESULT:
-
-MARKET 订单将直接返回成交结果；
-配合使用特殊 timeInForce 的 LIMIT 订单将直接返回成交或过期拒绝结果。
-STOP_MARKET, TAKE_PROFIT_MARKET 配合 closePosition=true:
-
-条件单触发依照上述条件单触发逻辑
-条件触发后，平掉当时持有所有多头仓位(若为卖单)或当时持有所有空头仓位(若为买单)
-不支持 quantity 参数
-自带只平仓属性，不支持reduceOnly参数
-双开模式下,LONG方向上不支持BUY; SHORT 方向上不支持SELL
-selfTradePreventionMode 仅在 timeInForce为IOC或GTC或GTD时生效.
-
-极端行情时，timeInForce为GTD的订单自动取消可能有一定延迟
-
-响应示例
-{
- 	"clientOrderId": "testOrder", // 用户自定义的订单号
- 	"cumQty": "0",
- 	"cumQuote": "0", // 成交金额
- 	"executedQty": "0", // 成交量
- 	"orderId": 22542179, // 系统订单号
- 	"avgPrice": "0.00000",	// 平均成交价
- 	"origQty": "10", // 原始委托数量
- 	"price": "0", // 委托价格
- 	"reduceOnly": false, // 仅减仓
- 	"side": "SELL", // 买卖方向
- 	"positionSide": "SHORT", // 持仓方向
- 	"status": "NEW", // 订单状态
- 	"stopPrice": "0", // 触发价，对`TRAILING_STOP_MARKET`无效
- 	"closePosition": false,   // 是否条件全平仓
- 	"symbol": "BTCUSDT", // 交易对
- 	"timeInForce": "GTD", // 有效方法
- 	"type": "TRAILING_STOP_MARKET", // 订单类型
- 	"origType": "TRAILING_STOP_MARKET",  // 触发前订单类型
- 	"activatePrice": "9020", // 跟踪止损激活价格, 仅`TRAILING_STOP_MARKET` 订单返回此字段
-  	"priceRate": "0.3",	// 跟踪止损回调比例, 仅`TRAILING_STOP_MARKET` 订单返回此字段
- 	"updateTime": 1566818724722, // 更新时间
- 	"workingType": "CONTRACT_PRICE", // 条件价格触发类型
- 	"priceProtect": false,            // 是否开启条件单触发保护
- 	"priceMatch": "NONE",              //盘口价格下单模式
- 	"selfTradePreventionMode": "NONE", //订单自成交保护模式
- 	"goodTillDate": 1693207680000      //订单TIF为GTD时的自动取消时间
-}
         """
 
         params = order.to_params()

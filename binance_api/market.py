@@ -8,14 +8,14 @@ _RATIO_PERIODS = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
 
 
 class BinanceMarketData:
-    """行情查询接口封装，目前支持交割合约K线数据。
+    """行情查询接口封装，目前支持 U 本位合约 K 线数据。
     """
 
     def __init__(
         self,
         client: BinanceClient,
         *,
-        version_prefix: str = "/fapi/v1",
+        version_prefix: str = "/dapi/v1",
         linear_version_prefix: str = "/fapi/v1",
     ) -> None:
         self.client = client

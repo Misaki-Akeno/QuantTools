@@ -1,14 +1,13 @@
 from .client import BinanceClient, build_client_from_env
-from .exceptions import BinanceAPIError
-from .orders import OrderRequest
-from .trading import BinanceDeliveryTrading
-from .market_data import BinanceMarketData
+from .utils import BinanceAPIError
+from .market import BinanceMarketData
+from .trade import BinanceTrading, OrderRequest
 
 __all__ = [
     "BinanceAPIError",
     "BinanceClient",
     "build_client_from_env",
-    "BinanceDeliveryTrading",
     "BinanceMarketData",
+    "BinanceTrading",
     "OrderRequest",
 ]
