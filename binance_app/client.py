@@ -15,6 +15,7 @@ class BinanceClient:
             'Content-Type': 'application/json'
         })
         self.time_offset = 0
+        self.sync_time()  # Synchronize time on initialization
 
     def get_timestamp(self):
         return int((time.time() * 1000) + self.time_offset)
@@ -33,7 +34,7 @@ class BinanceClient:
             # Calculate offset: server_time = local_time + offset
             # offset = server_time - local_time
             self.time_offset = server_time - local_time
-            print(f"系统时间已同步。本地时间偏移: {self.time_offset}ms")
+            # print(f"系统时间已同步。本地时间偏移: {self.time_offset}ms")
         except Exception as e:
             print(f"时间同步失败: {e}")
 

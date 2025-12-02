@@ -23,34 +23,21 @@ def safe_float(value, default=0.0):
     except (TypeError, ValueError):
         return default
 
-def get_decimal_places(value):
-    """Get number of decimal places from a string like '0.00100'"""
-    try:
-        d = Decimal(str(value)).normalize()
-        exponent = d.as_tuple().exponent
-        if exponent > 0:
-            return 0
-        return abs(exponent)
-    except:
-        return 2
-
 def format_price(price, tick_size):
     """Format price according to tick_size"""
-    precision = get_decimal_places(tick_size)
-    # Round to nearest tick
     d_price = Decimal(str(price))
     d_tick = Decimal(str(tick_size))
+    # Round to nearest tick
     rounded = (d_price / d_tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_tick
-    return f"{rounded:.{precision}f}"
+    return f"{rounded.quantize(d_tick)}"
 
 def format_qty(qty, step_size):
     """Format quantity according to step_size"""
-    precision = get_decimal_places(step_size)
-    # Round down for quantity to be safe
     d_qty = Decimal(str(qty))
     d_step = Decimal(str(step_size))
+    # Round down for quantity to be safe
     rounded = (d_qty / d_step).quantize(Decimal("1"), rounding=ROUND_FLOOR) * d_step
-    return f"{rounded:.{precision}f}"
+    return f"{rounded.quantize(d_step)}"
 
 
 def main(page: ft.Page):
@@ -149,7 +136,7 @@ def main(page: ft.Page):
     position_info_text = ft.Text("持仓: --", size=13)
     
     @ui_error_handler
-    def refresh_data(_=None):
+    def refresh_data():
         # 1. Get Account Info
         account_info = account_client.get_account_info()
         if account_info:
@@ -180,7 +167,10 @@ def main(page: ft.Page):
             price = safe_float(ticker.get("price"))
             ticker_price_text.value = f"现价: {price:.2f}"
 
-        page.update()
+        margin_balance_text.update()
+        available_balance_text.update()
+        ticker_price_text.update()
+        position_info_text.update()
 
     symbol_input.on_change = lambda e: [state.update({"symbol": e.control.value.upper()}), update_filters(), refresh_data()]
     
@@ -323,7 +313,7 @@ def main(page: ft.Page):
         if n <= 0 or interval <= 0 or qty <= 0:
             return notify_error("参数必须大于0")
 
-        refresh_data(None)
+        refresh_data()
         if not state["ticker"]: return notify_error("无法获取价格")
         
         current_price = safe_float(state["ticker"]["price"])
@@ -436,6 +426,7 @@ def main(page: ft.Page):
         gt_log_lv.update()
         
         state["grid_orders"] = placed_ids
+        
         push_status(f"网格挂单完成: {len(placed_ids)} 笔")
         refresh_data()
 
@@ -537,7 +528,7 @@ def main(page: ft.Page):
         def _loop():
             while state.get("auto_refresh_running"):
                 try:
-                    refresh_data(None)
+                    refresh_data()
                 except Exception as e:
                     print(f"Auto-refresh error: {e}")
                 time.sleep(1)
