@@ -1,6 +1,5 @@
 import flet as ft
 from flet import Colors
-import math
 import threading
 import time
 import concurrent.futures
@@ -45,7 +44,7 @@ def main(page: ft.Page):
     page.horizontal_alignment = "stretch"
     page.window.always_on_top = True
     page.window.width = 400
-    page.window.height = 700
+    page.window.height = 560
     page.theme_mode = ft.ThemeMode.DARK
     page.fonts = {
         "Maple": "fonts/MapleMono-NF-CN-Regular.ttf",
@@ -64,10 +63,8 @@ def main(page: ft.Page):
     state = {
         "symbol": "ETHUSDC",
         "last_order": {"order_id": None, "client_id": None},
-        "grid_orders": [],  # List of orderIds placed by grid
         "position": None,   # Current position data
         "ticker": None,     # Current ticker data
-        "auto_refresh_running": False,
         "filters": {
             "tick_size": "0.01",
             "step_size": "0.001"
@@ -132,8 +129,7 @@ def main(page: ft.Page):
     )
 
     # Info Display
-    margin_balance_text = ft.Text("权益: --", size=13)
-    available_balance_text = ft.Text("可用: --", size=13)
+    balance_text = ft.Text("权益: --/--", size=13)
     ticker_price_text = ft.Text("现价: --", size=13, weight=ft.FontWeight.BOLD, color=Colors.YELLOW)
     position_info_text = ft.Text("持仓: --", size=13)
     
@@ -145,17 +141,19 @@ def main(page: ft.Page):
             state["account"] = account_info
             equity = safe_float(account_info.get("accountEquity"))
             avail = safe_float(account_info.get("totalAvailableBalance"))
-            margin_balance_text.value = f"权益: {equity:.2f}"
-            available_balance_text.value = f"可用: {avail:.2f}"
+            balance_text.value = f"权益: {avail:.2f}/{equity:.2f}"
 
+        # 2. Get UM Account Info (Positions)
+        um_account_info = account_client.get_um_account_info()
+        if um_account_info:
             # Find Position
-            positions = account_info.get("positions") or []
+            positions = um_account_info.get("positions") or []
             pos = next((p for p in positions if p.get("symbol") == state["symbol"]), None)
             state["position"] = pos
             if pos:
                 amt = safe_float(pos.get("positionAmt"))
                 entry = safe_float(pos.get("entryPrice"))
-                pnl = safe_float(pos.get("unRealizedProfit"))
+                pnl = safe_float(pos.get("unrealizedProfit"))
                 position_info_text.value = f"持仓: {amt} @ {entry:.2f} (PnL: {pnl:.2f})"
                 position_info_text.color = Colors.GREEN if pnl >= 0 else Colors.RED
             else:
@@ -169,8 +167,7 @@ def main(page: ft.Page):
             price = safe_float(ticker.get("price"))
             ticker_price_text.value = f"现价: {price:.2f}"
 
-        margin_balance_text.update()
-        available_balance_text.update()
+        balance_text.update()
         ticker_price_text.update()
         position_info_text.update()
     
@@ -209,13 +206,6 @@ def main(page: ft.Page):
             refresh_data()
 
     @ui_error_handler
-    def qt_cancel_last(_):
-        if not state["last_order"]["order_id"]: return notify_error("无上次订单")
-        trade_client.cancel_order(state["symbol"], orderId=state["last_order"]["order_id"])
-        push_status("撤销上次订单成功")
-        refresh_data()
-
-    @ui_error_handler
     def qt_cancel_all(_):
         trade_client.cancel_all_orders(state["symbol"])
         push_status("撤销全部订单成功")
@@ -236,45 +226,30 @@ def main(page: ft.Page):
             ft.Text("价格匹配下单 (GTC/GTX)", size=14, weight=ft.FontWeight.BOLD),
             ft.Row(qt_buttons[:2], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             ft.Row(qt_buttons[2:], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ft.Divider(),
-            ft.Row([
-                ft.OutlinedButton("撤销上次", on_click=qt_cancel_last, expand=True),
-                ft.OutlinedButton("撤销全部", on_click=qt_cancel_all, expand=True),
-            ]),
             qt_last_order_text
         ], spacing=15),
-        padding=20
+        padding=10
     )
 
     # --- Tab 2: Grid Trade ---
     gt_n_field = ft.TextField(label="单边数量", value="2", width=100, height=40, content_padding=10, text_size=14)
     gt_interval_field = ft.TextField(label="网格间隔", value="1", width=100, height=40, content_padding=10, text_size=14)
     gt_qty_field = ft.TextField(label="单笔数量", value="0.01", width=100, height=40, content_padding=10, text_size=14)
-    gt_direction_switch = ft.Switch(label="看多/看空", value=True, active_color=Colors.GREEN, inactive_thumb_color=Colors.RED)
-    gt_reduce_checkbox = ft.Checkbox(label="只减仓模式", value=False)
     
-    gt_log_lv = ft.ListView(expand=True, spacing=2, auto_scroll=True)
-    gt_log_container = ft.Container(
-        content=gt_log_lv,
-        height=150,
-        border=ft.border.all(1, ft.Colors.with_opacity(0.2, Colors.WHITE)),
-        border_radius=5,
-        padding=5,
+    gt_strategy_radio = ft.RadioGroup(
+        content=ft.Row([
+            ft.Radio(value="LONG", label="看多(L)"),
+            ft.Radio(value="SHORT", label="看空(S)"),
+            ft.Radio(value="NEUTRAL", label="中性(N)"),
+        ]),
+        value="NEUTRAL"
     )
-
-    def log_grid(msg: str):
-        gt_log_lv.controls.append(ft.Text(f"[{time.strftime('%H:%M:%S')}] {msg}", size=11, font_family="Maple"))
-        gt_log_lv.update()
-
+    
     @ui_error_handler
-    def gt_cancel_grid(_, refresh=True):
+    def gt_cancel_grid(_):
         trade_client.cancel_all_orders(state["symbol"])
-        state["grid_orders"] = []
-        msg = "已撤销当前交易对全部订单"
-        push_status(msg)
-        log_grid(msg)
-        if refresh:
-            refresh_data()
+        push_status("已撤销当前交易对全部订单")
+        refresh_data()
 
     @ui_error_handler
     def gt_place_grid(_):
@@ -289,12 +264,13 @@ def main(page: ft.Page):
         if n <= 0 or interval <= 0 or qty <= 0:
             return notify_error("参数必须大于0")
 
+        gt_cancel_grid(None)
         refresh_data()
-        if not state["ticker"]: return notify_error("无法获取价格")
+        if not state["ticker"]: 
+            return notify_error("无法获取价格")
         
         current_price = safe_float(state["ticker"]["price"])
-        is_long_view = gt_direction_switch.value
-        is_reduce_mode = gt_reduce_checkbox.value
+        strategy = gt_strategy_radio.value
         pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0.0
 
         d_interval = Decimal(str(interval))
@@ -308,6 +284,11 @@ def main(page: ft.Page):
         step_size = state["filters"]["step_size"]
         formatted_qty = format_qty(qty, step_size)
 
+        # 当有持仓时，看多策略的SELL订单和看空策略的BUY订单设为reduceOnly
+        # 当无持仓时，所有订单都不是reduceOnly，可以正常开仓
+        sell_reduce_only = (strategy == "LONG" and pos_amt > 0)
+        buy_reduce_only = (strategy == "SHORT" and pos_amt < 0)
+
         # Generate Upper Orders (SELL)
         count = 0
         i = 0
@@ -315,13 +296,13 @@ def main(page: ft.Page):
             p = base_grid + (Decimal(i) * d_interval)
             if p > d_current_price:
                 side = "SELL"
-                ro = is_reduce_mode and is_long_view
                 
-                if ro and pos_amt <= 0:
+                # 只有在有多头持仓时，SELL订单才需要reduceOnly
+                if sell_reduce_only and pos_amt <= 0:
                     i += 1
                     continue
                 
-                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": ro})
+                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": sell_reduce_only})
                 count += 1
             i += 1
             if i > n * 10: break
@@ -333,17 +314,17 @@ def main(page: ft.Page):
             p = base_grid - (Decimal(i) * d_interval)
             if p < d_current_price:
                 side = "BUY"
-                ro = is_reduce_mode and not is_long_view
                 
-                if ro and pos_amt >= 0:
+                # 只有在有空头持仓时，BUY订单才需要reduceOnly  
+                if buy_reduce_only and pos_amt >= 0:
                     i += 1
                     continue
 
-                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": ro})
+                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": buy_reduce_only})
                 count += 1
             i += 1
             if i > n * 10: break
-
+        
         # Check position size limit for ReduceOnly orders
         ro_orders = [o for o in orders_to_place if o["reduceOnly"]]
         if ro_orders:
@@ -359,8 +340,8 @@ def main(page: ft.Page):
                     new_orders = [o for o in orders_to_place if not o["reduceOnly"]]
                     new_orders.extend(kept_ro)
                     orders_to_place = new_orders
-                    push_status(f"只减仓单量限制: 调整为 {len(kept_ro)} 单")
-
+                    print(f"只减仓单量限制: 调整为 {len(kept_ro)} 单")
+        
         def place_one(o):
             try:
                 res = trade_client.new_order(
@@ -379,7 +360,6 @@ def main(page: ft.Page):
                 return False, f"下单失败: {o['side']} @ {o['price']} - {str(e)}"
             return False, "下单未知错误"
 
-        logs = []
         success_count = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(place_one, o) for o in orders_to_place]
@@ -387,13 +367,6 @@ def main(page: ft.Page):
                 success, msg = future.result()
                 if success:
                     success_count += 1
-                if msg:
-                    logs.append(msg)
-        
-        # Batch update logs
-        for msg in logs:
-            gt_log_lv.controls.append(ft.Text(f"[{time.strftime('%H:%M:%S')}] {msg}", size=11, font_family="Maple"))
-        gt_log_lv.update()
         
         push_status(f"网格挂单完成: {success_count} 笔")
         refresh_data()
@@ -401,13 +374,11 @@ def main(page: ft.Page):
     tab_grid = ft.Container(
         content=ft.Column([
             ft.Row([gt_n_field, gt_interval_field, gt_qty_field], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ft.Row([gt_direction_switch, gt_reduce_checkbox], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            ft.Container(content=gt_strategy_radio, padding=ft.padding.only(bottom=5)),
             ft.Row([
                 ft.ElevatedButton("执行网格挂单", on_click=gt_place_grid, expand=True, color=Colors.WHITE, bgcolor=Colors.BLUE_700),
                 ft.OutlinedButton("撤销网格", on_click=gt_cancel_grid, expand=True),
             ]),
-            ft.Text("执行日志:", size=12, weight=ft.FontWeight.BOLD),
-            gt_log_container
         ], spacing=10),
         padding=20
     )
@@ -473,8 +444,8 @@ def main(page: ft.Page):
             ft.Row([symbol_input, refresh_btn]),
             ft.Container(
                 content=ft.Column([
-                    ft.Row([ticker_price_text, margin_balance_text], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    ft.Row([position_info_text, available_balance_text], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Row([ticker_price_text, balance_text], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    ft.Row([position_info_text], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 ]),
                 padding=5,
                 bgcolor=ft.Colors.with_opacity(0.1, Colors.WHITE),
@@ -488,25 +459,9 @@ def main(page: ft.Page):
         ], expand=True)
     )
 
-    def start_auto_refresh():
-        if state.get("auto_refresh_running"):
-            return
-        state["auto_refresh_running"] = True
-
-        def _loop():
-            while state.get("auto_refresh_running"):
-                try:
-                    refresh_data()
-                except Exception as e:
-                    print(f"Auto-refresh error: {e}")
-                time.sleep(1)
-
-        t = threading.Thread(target=_loop, daemon=True)
-        t.start()
-
+    # Initialize
     update_filters()
     refresh_data()
-    start_auto_refresh()
 
 if __name__ == "__main__":
     ft.app(target=main, assets_dir="assets")

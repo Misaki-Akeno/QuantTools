@@ -88,6 +88,31 @@ class UMTradeClient(BinanceClient):
         """
         查询当前UM挂单 (USER-DATA)
         GET /papi/v1/um/openOrders
+        
+        [
+  {
+    "avgPrice": "0.00000",
+    "clientOrderId": "abc",
+    "cumQuote": "0",
+    "executedQty": "0",
+    "orderId": 1917641,
+    "origQty": "0.40",
+    "origType": "LIMIT",
+    "price": "0",
+    "reduceOnly": false,
+    "side": "BUY",
+    "positionSide": "SHORT",
+    "status": "NEW",
+    "symbol": "BTCUSDT",
+    "time": 1579276756075,            
+    "timeInForce": "GTC",
+    "type": "LIMIT",
+    "updateTime": 1579276756075，
+    "selfTradePreventionMode": "NONE", 
+    "goodTillDate": 0,
+    "priceMatch": "NONE"     
+  }
+]
         """
         params = {}
         if symbol:
