@@ -353,63 +353,90 @@ def main(page: ft.Page):
         step_size = state["filters"]["step_size"]
         formatted_qty = format_qty(qty, step_size)
 
-        # 当有持仓时，看多策略的SELL订单和看空策略的BUY订单设为reduceOnly
-        # 当无持仓时，所有订单都不是reduceOnly，可以正常开仓
-        sell_reduce_only = (strategy == "LONG" and pos_amt > 0)
-        buy_reduce_only = (strategy == "SHORT" and pos_amt < 0)
-
-        # Generate Upper Orders (SELL)
-        count = 0
-        i = 0
-        while count < n:
-            p = base_grid + (Decimal(i) * d_interval)
-            if p > d_current_price:
-                side = "SELL"
-                
-                # 只有在有多头持仓时，SELL订单才需要reduceOnly
-                if sell_reduce_only and pos_amt <= 0:
+        # 单向持仓模式策略逻辑
+        if strategy == "LONG":
+            # 看多策略：只允许BUY开仓，SELL平仓
+            # Generate Lower Orders (BUY) - 开仓订单
+            count = 0
+            i = 1  # 从1开始，避免当前价格
+            while count < n:
+                p = base_grid - (Decimal(i) * d_interval)
+                if p < d_current_price:
+                    orders_to_place.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": False})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+            
+            # Generate Upper Orders (SELL) - 平仓订单 (只有持多仓时才下)
+            if pos_amt > 0:
+                count = 0
+                i = 1
+                max_sell_orders = min(n, int(pos_amt / qty))  # 限制平仓单数量
+                while count < max_sell_orders:
+                    p = base_grid + (Decimal(i) * d_interval)
+                    if p > d_current_price:
+                        orders_to_place.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": True})
+                        count += 1
                     i += 1
-                    continue
-                
-                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": sell_reduce_only})
-                count += 1
-            i += 1
-            if i > n * 10: break
-
-        # Generate Lower Orders (BUY)
-        count = 0
-        i = 0
-        while count < n:
-            p = base_grid - (Decimal(i) * d_interval)
-            if p < d_current_price:
-                side = "BUY"
-                
-                # 只有在有空头持仓时，BUY订单才需要reduceOnly  
-                if buy_reduce_only and pos_amt >= 0:
-                    i += 1
-                    continue
-
-                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": buy_reduce_only})
-                count += 1
-            i += 1
-            if i > n * 10: break
-        
-        # Check position size limit for ReduceOnly orders
-        ro_orders = [o for o in orders_to_place if o["reduceOnly"]]
-        if ro_orders:
-            total_ro_qty = len(ro_orders) * qty
-            abs_pos = abs(pos_amt)
-            if total_ro_qty > abs_pos:
-                max_ro_orders = int(abs_pos / qty)
-                if max_ro_orders < len(ro_orders):
-                    ro_orders.sort(key=lambda x: abs(float(x["price"]) - current_price))
-                    kept_ro = ro_orders[:max_ro_orders]
+                    if i > n * 10: break
                     
-                    # Rebuild orders_to_place
-                    new_orders = [o for o in orders_to_place if not o["reduceOnly"]]
-                    new_orders.extend(kept_ro)
-                    orders_to_place = new_orders
-                    print(f"只减仓单量限制: 调整为 {len(kept_ro)} 单")
+        elif strategy == "SHORT":
+            # 看空策略：只允许SELL开仓，BUY平仓
+            # Generate Upper Orders (SELL) - 开仓订单
+            count = 0
+            i = 1  # 从1开始，避免当前价格
+            while count < n:
+                p = base_grid + (Decimal(i) * d_interval)
+                if p > d_current_price:
+                    orders_to_place.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": False})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+            
+            # Generate Lower Orders (BUY) - 平仓订单 (只有持空仓时才下)
+            if pos_amt < 0:
+                count = 0
+                i = 1
+                max_buy_orders = min(n, int(abs(pos_amt) / qty))  # 限制平仓单数量
+                while count < max_buy_orders:
+                    p = base_grid - (Decimal(i) * d_interval)
+                    if p < d_current_price:
+                        orders_to_place.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": True})
+                        count += 1
+                    i += 1
+                    if i > n * 10: break
+                    
+        else:  # NEUTRAL strategy - 保持原有逻辑
+            # 当有持仓时，看多策略的SELL订单和看空策略的BUY订单设为reduceOnly
+            # 当无持仓时，所有订单都不是reduceOnly，可以正常开仓
+            sell_reduce_only = (pos_amt > 0)
+            buy_reduce_only = (pos_amt < 0)
+
+            # Generate Upper Orders (SELL)
+            count = 0
+            i = 1
+            while count < n:
+                p = base_grid + (Decimal(i) * d_interval)
+                if p > d_current_price:
+                    orders_to_place.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": sell_reduce_only})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+
+            # Generate Lower Orders (BUY)
+            count = 0
+            i = 1
+            while count < n:
+                p = base_grid - (Decimal(i) * d_interval)
+                if p < d_current_price:
+                    orders_to_place.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": buy_reduce_only})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+        
+        # 验证订单数量不为空
+        if not orders_to_place:
+            return notify_error(f"当前策略和持仓状态下没有可下的订单")
         
         def place_one(o):
             try:
@@ -477,6 +504,14 @@ def main(page: ft.Page):
         amt = safe_float(state["position"].get("positionAmt"))
         if amt == 0:
             return notify_error("当前无持仓")
+        
+        # 先撤销所有挂单
+        try:
+            trade_client.cancel_all_orders(state["symbol"])
+            push_status("已撤销所有挂单，准备平仓...")
+        except Exception as e:
+            print(f"撤单失败: {e}")
+            # 即使撤单失败也继续尝试平仓
         
         side = "SELL" if amt > 0 else "BUY"
         abs_qty = abs(amt)
