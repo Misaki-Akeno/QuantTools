@@ -246,8 +246,8 @@ def main(page: ft.Page):
     # --- Tab 2: Grid Trade ---
     gt_n_field = ft.TextField(label="单边数量", value="2", expand=True, height=40, content_padding=10, text_size=14)
     gt_interval_field = ft.TextField(label="网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
-    gt_qty_field = ft.TextField(label="单笔数量", value="0.01", expand=True, height=40, content_padding=10, text_size=14)
-    gt_auto_interval_field = ft.TextField(label="自动间隔", value="5", expand=True, height=40, content_padding=10, text_size=14)
+    gt_qty_field = ft.TextField(label="单笔数量", value="0.008", expand=True, height=40, content_padding=10, text_size=14)
+    gt_auto_interval_field = ft.TextField(label="自动间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
     
     gt_strategy_radio = ft.RadioGroup(
         content=ft.Row([
@@ -280,7 +280,7 @@ def main(page: ft.Page):
             return
         
         try:
-            gt_place_grid(None)
+            gt_place_grid_auto()  # 使用专用的自动网格函数
         except Exception as e:
             print(f"Auto grid execution error: {e}")
             push_status(f"自动网格执行错误: {str(e)}", success=False)
@@ -466,6 +466,264 @@ def main(page: ft.Page):
         
         push_status(f"网格挂单完成: {success_count} 笔")
         refresh_data()
+
+    @ui_error_handler
+    def gt_place_grid_auto():
+        """自动网格专用函数，会智能检查现有订单避免重复下单"""
+        # 1. Validate Inputs
+        try:
+            n = int(gt_n_field.value)
+            interval = float(gt_interval_field.value)
+            qty = float(gt_qty_field.value)
+        except ValueError:
+            return notify_error("输入参数无效")
+
+        if n <= 0 or interval <= 0 or qty <= 0:
+            return notify_error("参数必须大于0")
+
+        refresh_data()
+        if not state["ticker"]: 
+            return notify_error("无法获取价格")
+        
+        current_price = safe_float(state["ticker"]["price"])
+        strategy = gt_strategy_radio.value
+        pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0.0
+
+        d_interval = Decimal(str(interval))
+        d_current_price = Decimal(str(current_price))
+        
+        # Calculate base grid
+        base_grid = (d_current_price / d_interval).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_interval
+        
+        tick_size = state["filters"]["tick_size"]
+        step_size = state["filters"]["step_size"]
+        formatted_qty = format_qty(qty, step_size)
+
+        # 计算期望的订单列表 (使用与gt_place_grid相同的逻辑)
+        expected_orders = []
+        
+        if strategy == "LONG":
+            # 看多策略：只允许BUY开仓，SELL平仓
+            # Generate Lower Orders (BUY) - 开仓订单
+            count = 0
+            i = 1
+            while count < n:
+                p = base_grid - (Decimal(i) * d_interval)
+                if p < d_current_price:
+                    expected_orders.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": False})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+            
+            # Generate Upper Orders (SELL) - 平仓订单 (只有持多仓时才下)
+            if pos_amt > 0:
+                count = 0
+                i = 1
+                max_sell_orders = min(n, int(pos_amt / qty))
+                while count < max_sell_orders:
+                    p = base_grid + (Decimal(i) * d_interval)
+                    if p > d_current_price:
+                        expected_orders.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": True})
+                        count += 1
+                    i += 1
+                    if i > n * 10: break
+                    
+        elif strategy == "SHORT":
+            # 看空策略：只允许SELL开仓，BUY平仓
+            # Generate Upper Orders (SELL) - 开仓订单
+            count = 0
+            i = 1
+            while count < n:
+                p = base_grid + (Decimal(i) * d_interval)
+                if p > d_current_price:
+                    expected_orders.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": False})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+            
+            # Generate Lower Orders (BUY) - 平仓订单 (只有持空仓时才下)
+            if pos_amt < 0:
+                count = 0
+                i = 1
+                max_buy_orders = min(n, int(abs(pos_amt) / qty))
+                while count < max_buy_orders:
+                    p = base_grid - (Decimal(i) * d_interval)
+                    if p < d_current_price:
+                        expected_orders.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": True})
+                        count += 1
+                    i += 1
+                    if i > n * 10: break
+                    
+        else:  # NEUTRAL strategy
+            sell_reduce_only = (pos_amt > 0)
+            buy_reduce_only = (pos_amt < 0)
+
+            # Generate Upper Orders (SELL)
+            count = 0
+            i = 1
+            while count < n:
+                p = base_grid + (Decimal(i) * d_interval)
+                if p > d_current_price:
+                    expected_orders.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": sell_reduce_only})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+
+            # Generate Lower Orders (BUY)
+            count = 0
+            i = 1
+            while count < n:
+                p = base_grid - (Decimal(i) * d_interval)
+                if p < d_current_price:
+                    expected_orders.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": buy_reduce_only})
+                    count += 1
+                i += 1
+                if i > n * 10: break
+
+        if not expected_orders:
+            return  # 静默返回，不显示错误信息
+        
+        # 获取当前挂单
+        try:
+            current_orders = trade_client.get_open_orders(state["symbol"])
+            if not current_orders:
+                current_orders = []
+        except Exception as e:
+            print(f"获取挂单失败: {e}")
+            current_orders = []
+        
+        # 检查哪些订单需要操作
+        orders_to_cancel, orders_to_place = check_order_differences(current_orders, expected_orders, formatted_qty)
+        
+        if not orders_to_cancel and not orders_to_place:
+            # push_status("网格订单已是最新状态，无需调整")
+            return
+
+        # 先撤销不需要的订单
+        canceled_count = 0
+        if orders_to_cancel:
+            canceled_count = cancel_specific_orders(orders_to_cancel)
+
+        # 下新订单
+        success_count = 0
+        if orders_to_place:
+            success_count = place_orders_batch(orders_to_place, formatted_qty)
+            
+        if canceled_count > 0 or success_count > 0:
+            push_status(f"自动调整: 撤销 {canceled_count} 笔, 新增 {success_count} 笔")
+        refresh_data()
+
+    def check_order_differences(current_orders, expected_orders, qty):
+        """基于价格范围的检查机制，包含去重逻辑"""
+        if not expected_orders:
+            return current_orders, []  # 没有期望订单，撤销所有当前订单
+        
+        # 获取期望订单的价格范围
+        expected_prices = [Decimal(str(order["price"])) for order in expected_orders]
+        min_expected_price = min(expected_prices)
+        max_expected_price = max(expected_prices)
+        
+        # 扩展容忍范围：向两边各扩展一个网格间隔
+        interval = Decimal(str(gt_interval_field.value))
+        price_range_min = min_expected_price - interval
+        price_range_max = max_expected_price + interval
+        
+        # 1. 找出超出范围的订单，直接撤销
+        orders_to_cancel = []
+        valid_current_orders = []
+        
+        for order in current_orders:
+            order_price = Decimal(str(order.get("price", "0")))
+            if order_price < price_range_min or order_price > price_range_max:
+                orders_to_cancel.append(order)
+            else:
+                valid_current_orders.append(order)
+        
+        # 2. 对在范围内的订单进行精确匹配去重
+        orders_to_place = []
+        
+        for expected_order in expected_orders:
+            exp_price = Decimal(str(expected_order["price"]))
+            exp_side = expected_order["side"]
+            exp_reduce_only = expected_order["reduceOnly"]
+            
+            # 检查是否已有相同的订单
+            found_match = False
+            for current_order in valid_current_orders:
+                cur_price = Decimal(str(current_order.get("price", "0")))
+                cur_side = current_order.get("side")
+                cur_reduce_only = current_order.get("reduceOnly", False)
+                cur_qty = current_order.get("origQty")
+                
+                # 精确匹配：价格、方向、reduceOnly标志、数量都必须一致
+                if (cur_price == exp_price and 
+                    cur_side == exp_side and 
+                    cur_reduce_only == exp_reduce_only and
+                    cur_qty == qty):
+                    found_match = True
+                    break
+            
+            # 如果没找到匹配的订单，需要新增
+            if not found_match:
+                orders_to_place.append(expected_order)
+        
+        return orders_to_cancel, orders_to_place
+
+    def cancel_specific_orders(orders_to_cancel):
+        """撤销指定订单，返回成功撤销的订单数量"""
+        if not orders_to_cancel:
+            return 0
+            
+        def cancel_one(order):
+            try:
+                result = trade_client.cancel_order(
+                    symbol=state["symbol"],
+                    orderId=order.get("orderId")
+                )
+                if result:
+                    return True, f"撤销成功: {order.get('orderId')}"
+            except Exception as e:
+                return False, f"撤销失败 {order.get('orderId')}: {str(e)}"
+            return False, "撤销未知错误"
+        
+        success_count = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(cancel_one, order) for order in orders_to_cancel]
+            for future in concurrent.futures.as_completed(futures):
+                success, msg = future.result()
+                if success:
+                    success_count += 1
+                else:
+                    print(msg)
+        return success_count
+
+    def place_orders_batch(orders_to_place, formatted_qty):
+        """批量下单"""
+        def place_one(o):
+            try:
+                res = trade_client.new_order(
+                    symbol=state["symbol"],
+                    side=o["side"],
+                    type="LIMIT",
+                    quantity=formatted_qty,
+                    price=o['price'],
+                    timeInForce="GTX",
+                    reduceOnly=o["reduceOnly"],
+                    newOrderRespType="ACK"
+                )
+                return res and "orderId" in res
+            except Exception as e:
+                print(f"下单失败: {o['side']} @ {o['price']} - {str(e)}")
+                return False
+
+        success_count = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(place_one, o) for o in orders_to_place]
+            for future in concurrent.futures.as_completed(futures):
+                if future.result():
+                    success_count += 1
+        
+        return success_count
 
     # Set button click event
     auto_toggle_btn.on_click = toggle_auto_execution
