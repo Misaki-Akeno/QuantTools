@@ -43,6 +43,7 @@ def format_qty(qty, step_size):
 def main(page: ft.Page):
     page.title = "ETHUSDC 交易终端"
     page.horizontal_alignment = "stretch"
+    page.window.always_on_top = True
     page.window.width = 400
     page.window.height = 700
     page.theme_mode = ft.ThemeMode.DARK
@@ -53,6 +54,7 @@ def main(page: ft.Page):
 
     page.theme = ft.Theme(font_family="Maple")
     page.padding = 10
+    page.update()
 
     account_client = UMAccountClient()
     trade_client = UMTradeClient()
@@ -136,7 +138,7 @@ def main(page: ft.Page):
     position_info_text = ft.Text("持仓: --", size=13)
     
     @ui_error_handler
-    def refresh_data():
+    def refresh_data(_=None):
         # 1. Get Account Info
         account_info = account_client.get_account_info()
         if account_info:
@@ -171,10 +173,8 @@ def main(page: ft.Page):
         available_balance_text.update()
         ticker_price_text.update()
         position_info_text.update()
-
-    symbol_input.on_change = lambda e: [state.update({"symbol": e.control.value.upper()}), update_filters(), refresh_data()]
     
-    refresh_btn = ft.TextButton("刷新", on_click=refresh_data, style=ft.ButtonStyle(color=ft.Colors.GREEN_300))
+    refresh_btn = ft.TextButton("刷新", on_click=lambda e: [state.update({"symbol": symbol_input.value.upper()}), update_filters(), refresh_data()], style=ft.ButtonStyle(color=ft.Colors.GREEN_300))
 
     # --- Tab 1: Quick Trade ---
     qt_qty_field = ft.TextField(label="数量", value="0.01", width=100, height=40, content_padding=10, text_size=14)

@@ -15,7 +15,7 @@ class BinanceClient:
             'Content-Type': 'application/json'
         })
         self.time_offset = 0
-        self.sync_time()  # Synchronize time on initialization
+        self.sync_time()
 
     def get_timestamp(self):
         return int((time.time() * 1000) + self.time_offset)
