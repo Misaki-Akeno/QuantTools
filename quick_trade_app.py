@@ -3,6 +3,7 @@ from flet import Colors
 import math
 import threading
 import time
+import concurrent.futures
 from binance_app.um_account_api import UMAccountClient
 from binance_app.um_trade_api import UMTradeClient
 from binance_app.market_api import UMMarketClient
@@ -223,7 +224,7 @@ def main(page: ft.Page):
         gt_log_lv.update()
 
     @ui_error_handler
-    def gt_cancel_grid(_):
+    def gt_cancel_grid(_, refresh=True):
         if not state["grid_orders"]:
             push_status("无记录的网格订单")
             return
@@ -231,18 +232,34 @@ def main(page: ft.Page):
         # Cancel tracked orders
         # Note: Ideally we use batch cancel or cancel all, but to be safe we cancel specific IDs or just cancel all if user prefers.
         # Here we try to cancel specific IDs.
-        count = 0
-        for oid in state["grid_orders"]:
+        
+        def cancel_one(oid):
             try:
                 trade_client.cancel_order(state["symbol"], orderId=oid)
-                count += 1
-            except Exception:
-                pass # Ignore if already filled/cancelled
+                return True, f"撤单成功: {oid}"
+            except Exception as e:
+                return False, f"撤单失败 {oid}: {str(e)}"
+
+        count = 0
+        logs = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(cancel_one, oid) for oid in state["grid_orders"]]
+            for future in concurrent.futures.as_completed(futures):
+                success, msg = future.result()
+                if success:
+                    count += 1
+                logs.append(msg)
         
+        # Batch update logs to UI
+        for msg in logs:
+            gt_log_lv.controls.append(ft.Text(f"[{time.strftime('%H:%M:%S')}] {msg}", size=11, font_family="Maple"))
+        gt_log_lv.update()
+
         state["grid_orders"] = []
         push_status(f"已尝试撤销 {count} 个网格订单")
         log_grid(f"已清理网格订单: {count} 个")
-        refresh_data()
+        if refresh:
+            refresh_data()
 
     @ui_error_handler
     def gt_place_grid(_):
@@ -257,11 +274,7 @@ def main(page: ft.Page):
         if n <= 0 or interval <= 0 or qty <= 0:
             return notify_error("参数必须大于0")
 
-        # 2. Cancel previous grid orders
-        if state["grid_orders"]:
-            gt_cancel_grid(None)
-
-        # 3. Get Context
+        # 2. Get Context (Moved up for speed optimization: Calculate -> Cancel -> Place)
         refresh_data(None) # Update price and position
         if not state["ticker"]: return notify_error("无法获取价格")
         
@@ -273,7 +286,7 @@ def main(page: ft.Page):
         pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0.0
         # pos_amt > 0 (Long), pos_amt < 0 (Short)
 
-        # 4. Calculate Grid Levels
+        # 3. Calculate Grid Levels
         # Grid lines: k * interval
         base_grid = round(current_price / interval) * interval
         
@@ -332,7 +345,7 @@ def main(page: ft.Page):
                 count += 1
             p -= interval
 
-        # 5. Place Orders
+        # 4. Place Orders (Cancel old ones first)
         # Check position size limit for ReduceOnly orders?
         # User said: "需要检查自己的单量"
         # Let's count how many RO orders we have and total qty
@@ -357,21 +370,46 @@ def main(page: ft.Page):
                     orders_to_place = new_orders
                     push_status(f"只减仓单量限制: 调整为 {len(kept_ro)} 单")
 
+        # Cancel previous grid orders NOW (Minimize downtime)
+        if state["grid_orders"]:
+            gt_cancel_grid(None, refresh=False)
+
         placed_ids = []
-        for o in orders_to_place:
-            res = trade_client.new_order(
-                symbol=state["symbol"],
-                side=o["side"],
-                type="LIMIT",
-                quantity=qty,
-                price=f"{o['price']:.2f}", # Adjust precision dynamically ideally
-                timeInForce="GTX", # Post Only
-                reduceOnly=o["reduceOnly"],
-                newOrderRespType="ACK"
-            )
-            if res and "orderId" in res:
-                placed_ids.append(res["orderId"])
-                push_status(f"网格单下单成功: {o['side']} {qty} @ {o['price']:.2f} {'(RO)' if o['reduceOnly'] else ''}")
+        
+        def place_one(o):
+            try:
+                res = trade_client.new_order(
+                    symbol=state["symbol"],
+                    side=o["side"],
+                    type="LIMIT",
+                    quantity=qty,
+                    price=f"{o['price']:.2f}", # Adjust precision dynamically ideally
+                    timeInForce="GTX", # Post Only
+                    reduceOnly=o["reduceOnly"],
+                    newOrderRespType="ACK"
+                )
+                if res and "orderId" in res:
+                    msg = f"下单成功: {o['side']} {qty} @ {o['price']:.2f} {'(RO)' if o['reduceOnly'] else ''}"
+                    return res["orderId"], msg
+            except Exception as e:
+                msg = f"下单失败: {o['side']} @ {o['price']:.2f} - {str(e)}"
+                return None, msg
+            return None, "下单未知错误"
+
+        logs = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(place_one, o) for o in orders_to_place]
+            for future in concurrent.futures.as_completed(futures):
+                oid, msg = future.result()
+                if oid:
+                    placed_ids.append(oid)
+                if msg:
+                    logs.append(msg)
+        
+        # Batch update logs
+        for msg in logs:
+            gt_log_lv.controls.append(ft.Text(f"[{time.strftime('%H:%M:%S')}] {msg}", size=11, font_family="Maple"))
+        gt_log_lv.update()
         
         state["grid_orders"] = placed_ids
         push_status(f"网格挂单完成: {len(placed_ids)} 笔")
