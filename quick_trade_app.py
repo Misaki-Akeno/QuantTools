@@ -9,7 +9,6 @@ from binance_app.um_account_api import UMAccountClient
 from binance_app.um_trade_api import UMTradeClient
 from binance_app.market_api import UMMarketClient
 
-SUPPORTED_SYMBOLS = ["ETHUSDC"]
 PRICE_MATCH_BUTTONS = [
     {"label": "对手价1", "match_key": "OPPONENT", "tif": "GTC"},
     {"label": "同向价1", "match_key": "QUEUE", "tif": "GTX"},
@@ -23,10 +22,6 @@ def safe_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def format_number(value, precision=4):
-    return f"{safe_float(value):,.{precision}f}"
 
 def get_decimal_places(value):
     """Get number of decimal places from a string like '0.00100'"""
@@ -78,11 +73,12 @@ def main(page: ft.Page):
 
     # --- Shared State ---
     state = {
-        "symbol": SUPPORTED_SYMBOLS[0],
+        "symbol": "ETHUSDC",
         "last_order": {"order_id": None, "client_id": None},
         "grid_orders": [],  # List of orderIds placed by grid
         "position": None,   # Current position data
         "ticker": None,     # Current ticker data
+        "auto_refresh_running": False,
         "filters": {
             "tick_size": "0.01",
             "step_size": "0.001"
@@ -96,8 +92,6 @@ def main(page: ft.Page):
         status_text.value = f"[{time.strftime('%H:%M:%S')}] {message}"
         status_text.color = Colors.GREEN if success else Colors.RED
         status_text.update()
-        # page.snack_bar = ft.SnackBar(ft.Text(message), open=True)
-        # page.update()
 
     def notify_error(message: str):
         push_status(message, success=False)
@@ -120,7 +114,7 @@ def main(page: ft.Page):
                 if lot_size:
                     state["filters"]["step_size"] = lot_size["stepSize"]
                 
-                print(f"Updated filters for {target_symbol}: {state['filters']}")
+                push_status(f"Filters for {target_symbol}: {state['filters']['tick_size']}, {state['filters']['step_size']}")
         except Exception as e:
             print(f"Failed to update filters: {e}")
 
@@ -139,13 +133,13 @@ def main(page: ft.Page):
         return wrapper
 
     # --- Shared Controls ---
-    symbol_dropdown = ft.Dropdown(
+    symbol_input = ft.TextField(
         label="交易对",
-        value=SUPPORTED_SYMBOLS[0],
-        options=[ft.dropdown.Option(symbol) for symbol in SUPPORTED_SYMBOLS],
+        value="ETHUSDC",
         text_size=14,
         content_padding=10,
-        expand=True
+        expand=True,
+        on_submit=lambda e: [state.update({"symbol": e.control.value.upper()}), update_filters(), refresh_data()]
     )
 
     # Info Display
@@ -188,9 +182,9 @@ def main(page: ft.Page):
 
         page.update()
 
-    symbol_dropdown.on_change = lambda e: [state.update({"symbol": e.control.value}), update_filters(), refresh_data()]
+    symbol_input.on_change = lambda e: [state.update({"symbol": e.control.value.upper()}), update_filters(), refresh_data()]
     
-    refresh_btn = ft.IconButton(icon=ft.Icons.REFRESH,icon_color=ft.Colors.GREEN_300, on_click=refresh_data, tooltip="刷新数据")
+    refresh_btn = ft.TextButton("刷新", on_click=refresh_data, style=ft.ButtonStyle(color=ft.Colors.GREEN_300))
 
     # --- Tab 1: Quick Trade ---
     qt_qty_field = ft.TextField(label="数量", value="0.01", width=100, height=40, content_padding=10, text_size=14)
@@ -288,10 +282,6 @@ def main(page: ft.Page):
             push_status("无记录的网格订单")
             return
         
-        # Cancel tracked orders
-        # Note: Ideally we use batch cancel or cancel all, but to be safe we cancel specific IDs or just cancel all if user prefers.
-        # Here we try to cancel specific IDs.
-        
         def cancel_one(oid):
             try:
                 trade_client.cancel_order(state["symbol"], orderId=oid)
@@ -333,20 +323,14 @@ def main(page: ft.Page):
         if n <= 0 or interval <= 0 or qty <= 0:
             return notify_error("参数必须大于0")
 
-        # 2. Get Context (Moved up for speed optimization: Calculate -> Cancel -> Place)
-        refresh_data(None) # Update price and position
+        refresh_data(None)
         if not state["ticker"]: return notify_error("无法获取价格")
         
         current_price = safe_float(state["ticker"]["price"])
         is_long_view = gt_direction_switch.value
         is_reduce_mode = gt_reduce_checkbox.value
-        
-        # Position Check for Reduce Only
         pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0.0
-        # pos_amt > 0 (Long), pos_amt < 0 (Short)
 
-        # 3. Calculate Grid Levels
-        # Grid lines: k * interval
         d_interval = Decimal(str(interval))
         d_current_price = Decimal(str(current_price))
         
@@ -358,84 +342,50 @@ def main(page: ft.Page):
         step_size = state["filters"]["step_size"]
         formatted_qty = format_qty(qty, step_size)
 
-        # Generate Upper Orders (Price > Current) -> SELL
-        # If View=Long: Sell is Close (ReduceOnly if mode on).
-        # If View=Short: Sell is Open (Normal).
+        # Generate Upper Orders (SELL)
         count = 0
         i = 0
         while count < n:
             p = base_grid + (Decimal(i) * d_interval)
             if p > d_current_price:
-                # Determine params
                 side = "SELL"
-                ro = False
-                if is_reduce_mode:
-                    if is_long_view: # View Long, Sell is Opposite -> ReduceOnly
-                        ro = True
-                    else: # View Short, Sell is Same -> Normal
-                        ro = False
+                ro = is_reduce_mode and is_long_view
                 
-                # If RO, check position
-                if ro:
-                    # Can only place if we have Long position
-                    if pos_amt <= 0: 
-                        i += 1
-                        continue # Cannot close if no position
-                    # Optional: Check if we have enough position? 
-                    # For now, we just place. API might reject if total > position.
+                if ro and pos_amt <= 0:
+                    i += 1
+                    continue
                 
                 orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": ro})
                 count += 1
             i += 1
-            if i > n * 10: break # Safety break
+            if i > n * 10: break
 
-        # Generate Lower Orders (Price < Current) -> BUY
-        # If View=Long: Buy is Open (Normal).
-        # If View=Short: Buy is Close (ReduceOnly if mode on).
+        # Generate Lower Orders (BUY)
         count = 0
         i = 0
         while count < n:
             p = base_grid - (Decimal(i) * d_interval)
             if p < d_current_price:
                 side = "BUY"
-                ro = False
-                if is_reduce_mode:
-                    if is_long_view: # View Long, Buy is Same -> Normal
-                        ro = False
-                    else: # View Short, Buy is Opposite -> ReduceOnly
-                        ro = True
+                ro = is_reduce_mode and not is_long_view
                 
-                if ro:
-                    if pos_amt >= 0: # Cannot close short if no short position
-                        i += 1
-                        continue
+                if ro and pos_amt >= 0:
+                    i += 1
+                    continue
 
                 orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": ro})
                 count += 1
             i += 1
-            if i > n * 10: break # Safety break
+            if i > n * 10: break
 
-        # 4. Place Orders (Cancel old ones first)
-        # Check position size limit for ReduceOnly orders?
-        # User said: "需要检查自己的单量"
-        # Let's count how many RO orders we have and total qty
+        # Check position size limit for ReduceOnly orders
         ro_orders = [o for o in orders_to_place if o["reduceOnly"]]
         if ro_orders:
             total_ro_qty = len(ro_orders) * qty
             abs_pos = abs(pos_amt)
             if total_ro_qty > abs_pos:
-                # Prune orders? Or just warn?
-                # User said "只能是平空... 需要检查自己的单量"
-                # Let's limit the number of RO orders to match position
                 max_ro_orders = int(abs_pos / qty)
                 if max_ro_orders < len(ro_orders):
-                    # Keep only the ones closest to price?
-                    # Sort by proximity to current_price
-                    # Note: prices are strings now, need to convert back for sorting or just trust the order generation order?
-                    # The generation order is from base_grid outwards, so they are already sorted by proximity (mostly).
-                    # Upper orders: closest to furthest. Lower orders: closest to furthest.
-                    # But ro_orders contains both.
-                    
                     ro_orders.sort(key=lambda x: abs(float(x["price"]) - current_price))
                     kept_ro = ro_orders[:max_ro_orders]
                     
@@ -445,7 +395,6 @@ def main(page: ft.Page):
                     orders_to_place = new_orders
                     push_status(f"只减仓单量限制: 调整为 {len(kept_ro)} 单")
 
-        # Cancel previous grid orders NOW (Minimize downtime)
         if state["grid_orders"]:
             gt_cancel_grid(None, refresh=False)
 
@@ -458,8 +407,8 @@ def main(page: ft.Page):
                     side=o["side"],
                     type="LIMIT",
                     quantity=formatted_qty,
-                    price=o['price'], 
-                    timeInForce="GTX", # Post Only
+                    price=o['price'],
+                    timeInForce="GTX",
                     reduceOnly=o["reduceOnly"],
                     newOrderRespType="ACK"
                 )
@@ -509,8 +458,8 @@ def main(page: ft.Page):
         selected_index=0,
         animation_duration=300,
         tabs=[
-            ft.Tab(text="快速交易", content=tab_quick),
             ft.Tab(text="网格挂单", content=tab_grid),
+            ft.Tab(text="快速交易", content=tab_quick),
         ],
         expand=True,
     )
@@ -562,7 +511,7 @@ def main(page: ft.Page):
 
     page.add(
         ft.Column([
-            ft.Row([symbol_dropdown, refresh_btn]),
+            ft.Row([symbol_input, refresh_btn]),
             ft.Container(
                 content=ft.Column([
                     ft.Row([ticker_price_text, margin_balance_text], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
@@ -580,8 +529,25 @@ def main(page: ft.Page):
         ], expand=True)
     )
 
+    def start_auto_refresh():
+        if state.get("auto_refresh_running"):
+            return
+        state["auto_refresh_running"] = True
+
+        def _loop():
+            while state.get("auto_refresh_running"):
+                try:
+                    refresh_data(None)
+                except Exception as e:
+                    print(f"Auto-refresh error: {e}")
+                time.sleep(1)
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+
     update_filters()
     refresh_data()
+    start_auto_refresh()
 
 if __name__ == "__main__":
     ft.app(target=main, assets_dir="assets")
