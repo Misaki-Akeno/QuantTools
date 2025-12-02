@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import json
-from binance_app.um_api import UMFuturesClient
+from binance_app.um_account_api import UMAccountClient
 
 def main():
 
     # Initialize the client
-    client = UMFuturesClient()
+    client = UMAccountClient()
 
     print("--- 获取账户余额 ---")
     balance = client.get_balance()

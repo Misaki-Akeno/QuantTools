@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import time
 import json
-from binance_app.um_api import UMFuturesClient
+from binance_app.um_trade_api import UMTradeClient
 from binance_app.market_api import UMMarketClient
 
 def main():
     # Initialize clients
     market_client = UMMarketClient()
-    trade_client = UMFuturesClient()
+    trade_client = UMTradeClient()
     
     # Sync time to avoid timestamp errors
     print("--- 同步服务器时间 ---")
@@ -42,8 +42,7 @@ def main():
         type='LIMIT',
         quantity=quantity,
         price=safe_price,
-        positionSide='LONG',
-        timeInForce='GTC'
+        timeInForce='GTX'
     )
     
     if not order:
