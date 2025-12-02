@@ -61,13 +61,13 @@ class BinanceClient:
                     print(f"服务器返回错误 (Server Error): {json.dumps(error_data, indent=4)}")
                 except ValueError:
                     print(f"服务器返回内容 (Server Content): {e.response.text}")
-            return None
+            raise
         except ValueError as e:
             print(f"JSON解析失败 (JSON Parse Failed): {e}")
-            return None
+            raise
         except Exception as e:
             print(f"发生未知错误 (Unknown Error): {e}")
-            return None
+            raise
 
     def get(self, endpoint, params=None, signed=False):
         return self._request('GET', endpoint, params, signed)
