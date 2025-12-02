@@ -4,6 +4,7 @@ import math
 import threading
 import time
 import concurrent.futures
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from binance_app.um_account_api import UMAccountClient
 from binance_app.um_trade_api import UMTradeClient
 from binance_app.market_api import UMMarketClient
@@ -26,6 +27,35 @@ def safe_float(value, default=0.0):
 
 def format_number(value, precision=4):
     return f"{safe_float(value):,.{precision}f}"
+
+def get_decimal_places(value):
+    """Get number of decimal places from a string like '0.00100'"""
+    try:
+        d = Decimal(str(value)).normalize()
+        exponent = d.as_tuple().exponent
+        if exponent > 0:
+            return 0
+        return abs(exponent)
+    except:
+        return 2
+
+def format_price(price, tick_size):
+    """Format price according to tick_size"""
+    precision = get_decimal_places(tick_size)
+    # Round to nearest tick
+    d_price = Decimal(str(price))
+    d_tick = Decimal(str(tick_size))
+    rounded = (d_price / d_tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_tick
+    return f"{rounded:.{precision}f}"
+
+def format_qty(qty, step_size):
+    """Format quantity according to step_size"""
+    precision = get_decimal_places(step_size)
+    # Round down for quantity to be safe
+    d_qty = Decimal(str(qty))
+    d_step = Decimal(str(step_size))
+    rounded = (d_qty / d_step).quantize(Decimal("1"), rounding=ROUND_FLOOR) * d_step
+    return f"{rounded:.{precision}f}"
 
 
 def main(page: ft.Page):
@@ -53,6 +83,10 @@ def main(page: ft.Page):
         "grid_orders": [],  # List of orderIds placed by grid
         "position": None,   # Current position data
         "ticker": None,     # Current ticker data
+        "filters": {
+            "tick_size": "0.01",
+            "step_size": "0.001"
+        }
     }
 
     # --- UI Components ---
@@ -67,6 +101,28 @@ def main(page: ft.Page):
 
     def notify_error(message: str):
         push_status(message, success=False)
+
+    def update_filters():
+        try:
+            info = market_client.get_exchange_info()
+            if not info: return
+            
+            target_symbol = state["symbol"]
+            symbol_info = next((s for s in info.get("symbols", []) if s["symbol"] == target_symbol), None)
+            
+            if symbol_info:
+                # Extract filters
+                price_filter = next((f for f in symbol_info["filters"] if f["filterType"] == "PRICE_FILTER"), None)
+                lot_size = next((f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE"), None)
+                
+                if price_filter:
+                    state["filters"]["tick_size"] = price_filter["tickSize"]
+                if lot_size:
+                    state["filters"]["step_size"] = lot_size["stepSize"]
+                
+                print(f"Updated filters for {target_symbol}: {state['filters']}")
+        except Exception as e:
+            print(f"Failed to update filters: {e}")
 
     def ui_error_handler(func):
         def wrapper(*args, **kwargs):
@@ -132,7 +188,7 @@ def main(page: ft.Page):
 
         page.update()
 
-    symbol_dropdown.on_change = lambda e: [state.update({"symbol": e.control.value}), refresh_data()]
+    symbol_dropdown.on_change = lambda e: [state.update({"symbol": e.control.value}), update_filters(), refresh_data()]
     
     refresh_btn = ft.IconButton(icon=ft.Icons.REFRESH,icon_color=ft.Colors.GREEN_300, on_click=refresh_data, tooltip="刷新数据")
 
@@ -147,13 +203,16 @@ def main(page: ft.Page):
         qty = safe_float(qt_qty_field.value)
         if qty <= 0: return notify_error("数量无效")
         
+        step_size = state["filters"]["step_size"]
+        formatted_qty = format_qty(qty, step_size)
+        
         side = "BUY" if qt_side_switch.value else "SELL"
         
         res = trade_client.new_order(
             symbol=state["symbol"],
             side=side,
             type="LIMIT",
-            quantity=qty,
+            quantity=formatted_qty,
             timeInForce=tif,
             priceMatch=match_key,
             reduceOnly=qt_reduce_checkbox.value,
@@ -161,7 +220,7 @@ def main(page: ft.Page):
         )
         if res:
             state["last_order"] = {"order_id": res.get("orderId"), "client_id": res.get("clientOrderId")}
-            qt_last_order_text.value = f"上次: {side} {qty} @ {match_key}"
+            qt_last_order_text.value = f"上次: {side} {formatted_qty} @ {match_key}"
             push_status("快速下单成功")
             refresh_data()
 
@@ -288,17 +347,25 @@ def main(page: ft.Page):
 
         # 3. Calculate Grid Levels
         # Grid lines: k * interval
-        base_grid = round(current_price / interval) * interval
+        d_interval = Decimal(str(interval))
+        d_current_price = Decimal(str(current_price))
+        
+        # Calculate base grid
+        base_grid = (d_current_price / d_interval).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_interval
         
         orders_to_place = []
+        tick_size = state["filters"]["tick_size"]
+        step_size = state["filters"]["step_size"]
+        formatted_qty = format_qty(qty, step_size)
 
         # Generate Upper Orders (Price > Current) -> SELL
         # If View=Long: Sell is Close (ReduceOnly if mode on).
         # If View=Short: Sell is Open (Normal).
-        p = base_grid
         count = 0
+        i = 0
         while count < n:
-            if p > current_price:
+            p = base_grid + (Decimal(i) * d_interval)
+            if p > d_current_price:
                 # Determine params
                 side = "SELL"
                 ro = False
@@ -312,22 +379,24 @@ def main(page: ft.Page):
                 if ro:
                     # Can only place if we have Long position
                     if pos_amt <= 0: 
-                        p += interval
+                        i += 1
                         continue # Cannot close if no position
                     # Optional: Check if we have enough position? 
                     # For now, we just place. API might reject if total > position.
                 
-                orders_to_place.append({"price": p, "side": side, "reduceOnly": ro})
+                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": ro})
                 count += 1
-            p += interval
+            i += 1
+            if i > n * 10: break # Safety break
 
         # Generate Lower Orders (Price < Current) -> BUY
         # If View=Long: Buy is Open (Normal).
         # If View=Short: Buy is Close (ReduceOnly if mode on).
-        p = base_grid
         count = 0
+        i = 0
         while count < n:
-            if p < current_price:
+            p = base_grid - (Decimal(i) * d_interval)
+            if p < d_current_price:
                 side = "BUY"
                 ro = False
                 if is_reduce_mode:
@@ -338,12 +407,13 @@ def main(page: ft.Page):
                 
                 if ro:
                     if pos_amt >= 0: # Cannot close short if no short position
-                        p -= interval
+                        i += 1
                         continue
 
-                orders_to_place.append({"price": p, "side": side, "reduceOnly": ro})
+                orders_to_place.append({"price": format_price(p, tick_size), "side": side, "reduceOnly": ro})
                 count += 1
-            p -= interval
+            i += 1
+            if i > n * 10: break # Safety break
 
         # 4. Place Orders (Cancel old ones first)
         # Check position size limit for ReduceOnly orders?
@@ -361,7 +431,12 @@ def main(page: ft.Page):
                 if max_ro_orders < len(ro_orders):
                     # Keep only the ones closest to price?
                     # Sort by proximity to current_price
-                    ro_orders.sort(key=lambda x: abs(x["price"] - current_price))
+                    # Note: prices are strings now, need to convert back for sorting or just trust the order generation order?
+                    # The generation order is from base_grid outwards, so they are already sorted by proximity (mostly).
+                    # Upper orders: closest to furthest. Lower orders: closest to furthest.
+                    # But ro_orders contains both.
+                    
+                    ro_orders.sort(key=lambda x: abs(float(x["price"]) - current_price))
                     kept_ro = ro_orders[:max_ro_orders]
                     
                     # Rebuild orders_to_place
@@ -382,17 +457,17 @@ def main(page: ft.Page):
                     symbol=state["symbol"],
                     side=o["side"],
                     type="LIMIT",
-                    quantity=qty,
-                    price=f"{o['price']:.2f}", # Adjust precision dynamically ideally
+                    quantity=formatted_qty,
+                    price=o['price'], 
                     timeInForce="GTX", # Post Only
                     reduceOnly=o["reduceOnly"],
                     newOrderRespType="ACK"
                 )
                 if res and "orderId" in res:
-                    msg = f"下单成功: {o['side']} {qty} @ {o['price']:.2f} {'(RO)' if o['reduceOnly'] else ''}"
+                    msg = f"下单成功: {o['side']} {formatted_qty} @ {o['price']} {'(RO)' if o['reduceOnly'] else ''}"
                     return res["orderId"], msg
             except Exception as e:
-                msg = f"下单失败: {o['side']} @ {o['price']:.2f} - {str(e)}"
+                msg = f"下单失败: {o['side']} @ {o['price']} - {str(e)}"
                 return None, msg
             return None, "下单未知错误"
 
@@ -453,10 +528,13 @@ def main(page: ft.Page):
         side = "SELL" if amt > 0 else "BUY"
         abs_qty = abs(amt)
         
+        step_size = state["filters"]["step_size"]
+        formatted_qty = format_qty(abs_qty, step_size)
+        
         params = {
             "symbol": state["symbol"],
             "side": side,
-            "quantity": abs_qty,
+            "quantity": formatted_qty,
             "reduceOnly": True,
             "newOrderRespType": "RESULT"
         }
@@ -470,7 +548,7 @@ def main(page: ft.Page):
         
         res = trade_client.new_order(**params)
         if res:
-            push_status(f"已提交平仓: {strategy} {side} {abs_qty}")
+            push_status(f"已提交平仓: {strategy} {side} {formatted_qty}")
             refresh_data()
 
     close_buttons = ft.Row([
@@ -502,6 +580,7 @@ def main(page: ft.Page):
         ], expand=True)
     )
 
+    update_filters()
     refresh_data()
 
 if __name__ == "__main__":

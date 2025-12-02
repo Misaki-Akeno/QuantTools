@@ -5,6 +5,13 @@ class UMMarketClient(BinanceClient):
     def __init__(self):
         super().__init__(base_url=Config.FAPI_URL)
 
+    def get_exchange_info(self):
+        """
+        获取交易规则和交易对
+        GET /fapi/v1/exchangeInfo
+        """
+        return self.get('/fapi/v1/exchangeInfo', signed=False)
+
     def get_ticker_price(self, symbol):
         """
         最新价格V2
