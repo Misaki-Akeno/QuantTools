@@ -43,8 +43,8 @@ def main(page: ft.Page):
     page.title = "ETHUSDC 交易终端"
     page.horizontal_alignment = "stretch"
     page.window.always_on_top = True
-    page.window.width = 400
-    page.window.height = 560
+    page.window.width = 335
+    page.window.height = 620
     page.theme_mode = ft.ThemeMode.DARK
     page.fonts = {
         "Maple": "fonts/MapleMono-NF-CN-Regular.ttf",
@@ -54,6 +54,18 @@ def main(page: ft.Page):
     page.theme = ft.Theme(font_family="Maple")
     page.padding = 10
     page.update()
+
+    auto_execution_running = False
+    auto_timer = None
+
+    # Cleanup on close
+    def on_close(_):
+        nonlocal auto_execution_running, auto_timer
+        auto_execution_running = False
+        if auto_timer:
+            auto_timer.cancel()
+    
+    page.on_close = on_close
 
     account_client = UMAccountClient()
     trade_client = UMTradeClient()
@@ -100,7 +112,7 @@ def main(page: ft.Page):
                 if lot_size:
                     state["filters"]["step_size"] = lot_size["stepSize"]
                 
-                push_status(f"Filters for {target_symbol}: {state['filters']['tick_size']}, {state['filters']['step_size']}")
+                push_status(f"{target_symbol}: {state['filters']['tick_size']}, {state['filters']['step_size']}")
         except Exception as e:
             print(f"Failed to update filters: {e}")
 
@@ -232,17 +244,28 @@ def main(page: ft.Page):
     )
 
     # --- Tab 2: Grid Trade ---
-    gt_n_field = ft.TextField(label="单边数量", value="2", width=100, height=40, content_padding=10, text_size=14)
-    gt_interval_field = ft.TextField(label="网格间隔", value="1", width=100, height=40, content_padding=10, text_size=14)
-    gt_qty_field = ft.TextField(label="单笔数量", value="0.01", width=100, height=40, content_padding=10, text_size=14)
+    gt_n_field = ft.TextField(label="单边数量", value="2", expand=True, height=40, content_padding=10, text_size=14)
+    gt_interval_field = ft.TextField(label="网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
+    gt_qty_field = ft.TextField(label="单笔数量", value="0.01", expand=True, height=40, content_padding=10, text_size=14)
+    gt_auto_interval_field = ft.TextField(label="自动间隔", value="5", expand=True, height=40, content_padding=10, text_size=14)
     
     gt_strategy_radio = ft.RadioGroup(
         content=ft.Row([
-            ft.Radio(value="LONG", label="看多(L)"),
-            ft.Radio(value="SHORT", label="看空(S)"),
-            ft.Radio(value="NEUTRAL", label="中性(N)"),
+            ft.Radio(value="LONG", label="看多"),
+            ft.Radio(value="SHORT", label="看空"),
+            ft.Radio(value="NEUTRAL", label="中性"),
         ]),
         value="NEUTRAL"
+    )
+    
+    # Auto execution state variables are declared at the top of main()
+    
+    # Create auto execution toggle button
+    auto_toggle_btn = ft.ElevatedButton(
+        "开始自动执行",
+        expand=True,
+        color=Colors.WHITE,
+        bgcolor=Colors.GREEN_700
     )
     
     @ui_error_handler
@@ -250,6 +273,52 @@ def main(page: ft.Page):
         trade_client.cancel_all_orders(state["symbol"])
         push_status("已撤销当前交易对全部订单")
         refresh_data()
+
+    def auto_execute_grid():
+        nonlocal auto_execution_running, auto_timer
+        if not auto_execution_running:
+            return
+        
+        try:
+            gt_place_grid(None)
+        except Exception as e:
+            print(f"Auto grid execution error: {e}")
+            push_status(f"自动网格执行错误: {str(e)}", success=False)
+        
+        # Schedule next execution
+        if auto_execution_running:
+            interval = safe_float(gt_auto_interval_field.value)
+            if interval <= 0:
+                interval = 60  # default to 60 seconds
+            auto_timer = threading.Timer(interval, auto_execute_grid)
+            auto_timer.start()
+
+    @ui_error_handler
+    def toggle_auto_execution(_):
+        nonlocal auto_execution_running, auto_timer
+        
+        if auto_execution_running:
+            # 停止自动执行
+            auto_execution_running = False
+            if auto_timer:
+                auto_timer.cancel()
+                auto_timer = None
+            auto_toggle_btn.text = "开始自动执行"
+            auto_toggle_btn.bgcolor = Colors.GREEN_700
+            push_status("已停止自动网格执行")
+        else:
+            # 开始自动执行
+            interval = safe_float(gt_auto_interval_field.value)
+            if interval <= 0:
+                return notify_error("间隔秒数必须大于0")
+            
+            auto_execution_running = True
+            auto_toggle_btn.text = "停止自动执行"
+            auto_toggle_btn.bgcolor = Colors.RED_700
+            push_status(f"开始自动网格执行，每{interval}秒执行一次")
+            auto_execute_grid()
+        
+        auto_toggle_btn.update()
 
     @ui_error_handler
     def gt_place_grid(_):
@@ -371,14 +440,19 @@ def main(page: ft.Page):
         push_status(f"网格挂单完成: {success_count} 笔")
         refresh_data()
 
+    # Set button click event
+    auto_toggle_btn.on_click = toggle_auto_execution
+    
     tab_grid = ft.Container(
         content=ft.Column([
-            ft.Row([gt_n_field, gt_interval_field, gt_qty_field], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            ft.Row([gt_n_field, gt_interval_field]),
+            ft.Row([gt_qty_field, gt_auto_interval_field]),
             ft.Container(content=gt_strategy_radio, padding=ft.padding.only(bottom=5)),
             ft.Row([
                 ft.ElevatedButton("执行网格挂单", on_click=gt_place_grid, expand=True, color=Colors.WHITE, bgcolor=Colors.BLUE_700),
                 ft.OutlinedButton("撤销网格", on_click=gt_cancel_grid, expand=True),
             ]),
+            ft.Row([auto_toggle_btn]),
         ], spacing=10),
         padding=20
     )
@@ -433,7 +507,7 @@ def main(page: ft.Page):
     close_buttons = ft.Row([
         ft.ElevatedButton("市价全平", on_click=lambda _: close_position("MARKET"), 
                           style=ft.ButtonStyle(bgcolor=Colors.RED_900, color=Colors.WHITE, shape=ft.RoundedRectangleBorder(radius=5)), expand=True),
-        ft.ElevatedButton("同向价1全平", on_click=lambda _: close_position("QUEUE"), 
+        ft.ElevatedButton("同向1全平", on_click=lambda _: close_position("QUEUE"), 
                           style=ft.ButtonStyle(bgcolor=Colors.ORANGE_900, color=Colors.WHITE, shape=ft.RoundedRectangleBorder(radius=5)), expand=True),
         ft.ElevatedButton("撤销全部", on_click=qt_cancel_all, 
                           style=ft.ButtonStyle(bgcolor=Colors.GREY_800, color=Colors.WHITE, shape=ft.RoundedRectangleBorder(radius=5)), expand=True),
