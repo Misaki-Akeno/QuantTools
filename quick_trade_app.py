@@ -268,35 +268,11 @@ def main(page: ft.Page):
 
     @ui_error_handler
     def gt_cancel_grid(_, refresh=True):
-        if not state["grid_orders"]:
-            push_status("无记录的网格订单")
-            return
-        
-        def cancel_one(oid):
-            try:
-                trade_client.cancel_order(state["symbol"], orderId=oid)
-                return True, f"撤单成功: {oid}"
-            except Exception as e:
-                return False, f"撤单失败 {oid}: {str(e)}"
-
-        count = 0
-        logs = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(cancel_one, oid) for oid in state["grid_orders"]]
-            for future in concurrent.futures.as_completed(futures):
-                success, msg = future.result()
-                if success:
-                    count += 1
-                logs.append(msg)
-        
-        # Batch update logs to UI
-        for msg in logs:
-            gt_log_lv.controls.append(ft.Text(f"[{time.strftime('%H:%M:%S')}] {msg}", size=11, font_family="Maple"))
-        gt_log_lv.update()
-
+        trade_client.cancel_all_orders(state["symbol"])
         state["grid_orders"] = []
-        push_status(f"已尝试撤销 {count} 个网格订单")
-        log_grid(f"已清理网格订单: {count} 个")
+        msg = "已撤销当前交易对全部订单"
+        push_status(msg)
+        log_grid(msg)
         if refresh:
             refresh_data()
 
@@ -385,11 +361,6 @@ def main(page: ft.Page):
                     orders_to_place = new_orders
                     push_status(f"只减仓单量限制: 调整为 {len(kept_ro)} 单")
 
-        if state["grid_orders"]:
-            gt_cancel_grid(None, refresh=False)
-
-        placed_ids = []
-        
         def place_one(o):
             try:
                 res = trade_client.new_order(
@@ -403,20 +374,19 @@ def main(page: ft.Page):
                     newOrderRespType="ACK"
                 )
                 if res and "orderId" in res:
-                    msg = f"下单成功: {o['side']} {formatted_qty} @ {o['price']} {'(RO)' if o['reduceOnly'] else ''}"
-                    return res["orderId"], msg
+                    return True, f"下单成功: {o['side']} {formatted_qty} @ {o['price']} {'(RO)' if o['reduceOnly'] else ''}"
             except Exception as e:
-                msg = f"下单失败: {o['side']} @ {o['price']} - {str(e)}"
-                return None, msg
-            return None, "下单未知错误"
+                return False, f"下单失败: {o['side']} @ {o['price']} - {str(e)}"
+            return False, "下单未知错误"
 
         logs = []
+        success_count = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(place_one, o) for o in orders_to_place]
             for future in concurrent.futures.as_completed(futures):
-                oid, msg = future.result()
-                if oid:
-                    placed_ids.append(oid)
+                success, msg = future.result()
+                if success:
+                    success_count += 1
                 if msg:
                     logs.append(msg)
         
@@ -425,9 +395,7 @@ def main(page: ft.Page):
             gt_log_lv.controls.append(ft.Text(f"[{time.strftime('%H:%M:%S')}] {msg}", size=11, font_family="Maple"))
         gt_log_lv.update()
         
-        state["grid_orders"] = placed_ids
-        
-        push_status(f"网格挂单完成: {len(placed_ids)} 笔")
+        push_status(f"网格挂单完成: {success_count} 笔")
         refresh_data()
 
     tab_grid = ft.Container(
