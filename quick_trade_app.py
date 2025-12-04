@@ -8,6 +8,21 @@ from binance_app.um_account_api import UMAccountClient
 from binance_app.um_trade_api import UMTradeClient
 from binance_app.market_api import UMMarketClient
 
+# Default values as constants
+DEFAULT_SYMBOL = "SOLUSDC"
+DEFAULT_QT_QTY = "0.01"     # 快速交易默认数量
+DEFAULT_GT_N = "20"          # 网格单边数量
+DEFAULT_GT_BUY_INTERVAL = "0.05"   # 买入网格间隔
+DEFAULT_GT_SELL_INTERVAL = "0.05"  # 卖出网格间隔
+DEFAULT_GT_BUY_QTY = "0.04"
+DEFAULT_GT_SELL_QTY = "0.04"
+DEFAULT_GT_BASE_PRICE = ""
+DEFAULT_GT_STOP_LOSS = "1" # 止损百分比
+DEFAULT_GT_AUTO_INTERVAL = "1"
+DEFAULT_STRATEGY = "NEUTRAL"
+DEFAULT_WINDOW_WIDTH = 335
+DEFAULT_WINDOW_HEIGHT = 700
+
 PRICE_MATCH_BUTTONS = [
     {"label": "对手价1", "match_key": "OPPONENT", "tif": "GTC"},
     {"label": "同向价1", "match_key": "QUEUE", "tif": "GTX"},
@@ -45,8 +60,8 @@ def main(page: ft.Page):
     page.title = "ETHUSDC 交易终端"
     page.horizontal_alignment = "stretch"
     page.window.always_on_top = True
-    page.window.width = 335
-    page.window.height = 700
+    page.window.width = DEFAULT_WINDOW_WIDTH
+    page.window.height = DEFAULT_WINDOW_HEIGHT
     page.theme_mode = ft.ThemeMode.DARK
     page.fonts = {
         "Maple": "fonts/MapleMono-NF-CN-Regular.ttf",
@@ -73,7 +88,7 @@ def main(page: ft.Page):
 
     # --- Shared State ---
     state = {
-        "symbol": "ETHUSDC",
+        "symbol": DEFAULT_SYMBOL,
         "last_order": {"order_id": None, "client_id": None},
         "position": None,   # Current position data
         "ticker": None,     # Current ticker data
@@ -136,7 +151,7 @@ def main(page: ft.Page):
     # --- Shared Controls ---
     symbol_input = ft.TextField(
         label="交易对",
-        value="ETHUSDC",
+        value=DEFAULT_SYMBOL,
         text_size=14,
         content_padding=10,
         expand=True,
@@ -189,7 +204,7 @@ def main(page: ft.Page):
     refresh_btn = ft.TextButton("刷新", on_click=lambda e: [state.update({"symbol": symbol_input.value.upper()}), update_filters(), refresh_data()], style=ft.ButtonStyle(color=ft.Colors.GREEN_300))
 
     # --- Tab 1: Quick Trade ---
-    qt_qty_field = ft.TextField(label="数量", value="0.01", width=100, height=40, content_padding=10, text_size=14)
+    qt_qty_field = ft.TextField(label="数量", value=DEFAULT_QT_QTY, width=100, height=40, content_padding=10, text_size=14)
     qt_side_switch = ft.Switch(label="买入/卖出", value=True, active_color=Colors.GREEN,inactive_thumb_color=Colors.RED)
     qt_reduce_checkbox = ft.Checkbox(label="只减仓", value=False)
     qt_last_order_text = ft.Text("上次: --", size=12)
@@ -204,6 +219,8 @@ def main(page: ft.Page):
         
         side = "BUY" if qt_side_switch.value else "SELL"
         
+        print(f"[{time.strftime('%H:%M:%S')}] 快速交易下单 - 交易对: {state['symbol']}, 方向: {side}, 数量: {formatted_qty}, 价格匹配: {match_key}, 时间有效性: {tif}, 只减仓: {qt_reduce_checkbox.value}")
+        
         res = trade_client.new_order(
             symbol=state["symbol"],
             side=side,
@@ -214,11 +231,15 @@ def main(page: ft.Page):
             reduceOnly=qt_reduce_checkbox.value,
             newOrderRespType="RESULT"
         )
+        
         if res:
+            print(f"[{time.strftime('%H:%M:%S')}] 快速交易下单成功 - 订单ID: {res.get('orderId')}, 客户端ID: {res.get('clientOrderId')}, 成交数量: {res.get('executedQty')}, 状态: {res.get('status')}")
             state["last_order"] = {"order_id": res.get("orderId"), "client_id": res.get("clientOrderId")}
             qt_last_order_text.value = f"上次: {side} {formatted_qty} @ {match_key}"
             push_status("快速下单成功")
             refresh_data()
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] 快速交易下单失败 - 响应: {res}")
 
     @ui_error_handler
     def qt_cancel_all(_):
@@ -247,14 +268,14 @@ def main(page: ft.Page):
     )
 
     # --- Tab 2: Grid Trade ---
-    gt_n_field = ft.TextField(label="单边数量", value="1", expand=True, height=40, content_padding=10, text_size=14)
-    gt_buy_interval_field = ft.TextField(label="买入网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
-    gt_sell_interval_field = ft.TextField(label="卖出网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
-    gt_buy_qty_field = ft.TextField(label="买入数量", value="0.008", expand=True, height=40, content_padding=10, text_size=14)
-    gt_sell_qty_field = ft.TextField(label="卖出数量", value="0.008", expand=True, height=40, content_padding=10, text_size=14)
-    gt_base_price_field = ft.TextField(label="基准价格", value="", expand=True, height=40, content_padding=10, text_size=14, hint_text="留空=动态基准")
-    gt_stop_loss_field = ft.TextField(label="止损(%)", value="1", expand=True, height=40, content_padding=10, text_size=14)
-    gt_auto_interval_field = ft.TextField(label="自动间隔", value="0.5", expand=True, height=40, content_padding=10, text_size=14)
+    gt_n_field = ft.TextField(label="单边数量", value=DEFAULT_GT_N, expand=True, height=40, content_padding=10, text_size=14)
+    gt_buy_interval_field = ft.TextField(label="买入网格间隔", value=DEFAULT_GT_BUY_INTERVAL, expand=True, height=40, content_padding=10, text_size=14)
+    gt_sell_interval_field = ft.TextField(label="卖出网格间隔", value=DEFAULT_GT_SELL_INTERVAL, expand=True, height=40, content_padding=10, text_size=14)
+    gt_buy_qty_field = ft.TextField(label="买入数量", value=DEFAULT_GT_BUY_QTY, expand=True, height=40, content_padding=10, text_size=14)
+    gt_sell_qty_field = ft.TextField(label="卖出数量", value=DEFAULT_GT_SELL_QTY, expand=True, height=40, content_padding=10, text_size=14)
+    gt_base_price_field = ft.TextField(label="基准价格", value=DEFAULT_GT_BASE_PRICE, expand=True, height=40, content_padding=10, text_size=14, hint_text="留空=动态基准")
+    gt_stop_loss_field = ft.TextField(label="止损(%)", value=DEFAULT_GT_STOP_LOSS, expand=True, height=40, content_padding=10, text_size=14)
+    gt_auto_interval_field = ft.TextField(label="自动间隔", value=DEFAULT_GT_AUTO_INTERVAL, expand=True, height=40, content_padding=10, text_size=14)
     
     gt_strategy_radio = ft.RadioGroup(
         content=ft.Row([
@@ -262,7 +283,7 @@ def main(page: ft.Page):
             ft.Radio(value="SHORT", label="看空"),
             ft.Radio(value="NEUTRAL", label="中性"),
         ]),
-        value="NEUTRAL"
+        value=DEFAULT_STRATEGY
     )
     
     # Auto execution state variables are declared at the top of main()
@@ -628,8 +649,13 @@ def main(page: ft.Page):
         if not orders_to_place:
             return notify_error(f"当前策略和持仓状态下没有可下的订单")
         
+        print(f"[{time.strftime('%H:%M:%S')}] 网格挂单构建完成 - 订单数量: {len(orders_to_place)}")
+        for o in orders_to_place:
+            print(f"[{time.strftime('%H:%M:%S')}] 网格订单详情 - 方向: {o['side']}, 价格: {o['price']}, 数量: {o['qty']}, 只减仓: {o['reduceOnly']}")
+        
         def place_one(o):
             try:
+                print(f"[{time.strftime('%H:%M:%S')}] 网格下单 - 交易对: {state['symbol']}, 方向: {o['side']}, 价格: {o['price']}, 数量: {o['qty']}, 只减仓: {o['reduceOnly']}")
                 res = trade_client.new_order(
                     symbol=state["symbol"],
                     side=o["side"],
@@ -641,9 +667,11 @@ def main(page: ft.Page):
                     newOrderRespType="ACK"
                 )
                 if res and "orderId" in res:
+                    print(f"[{time.strftime('%H:%M:%S')}] 网格下单成功 - 订单ID: {res.get('orderId')}, 方向: {o['side']}, 价格: {o['price']}")
                     return True, f"下单成功: {o['side']} {o['qty']} @ {o['price']} {'(RO)' if o['reduceOnly'] else ''}"
             except Exception as e:
-                return False, f"下单失败: {o['side']} @ {o['price']} - {str(e)}"
+                print(f"[{time.strftime('%H:%M:%S')}] 网格下单失败 - 方向: {o['side']}, 价格: {o['price']}, 错误: {str(e)}")
+                return False, f"下单失败: {o['side']} @ {o['price']}"
             return False, "下单未知错误"
 
         success_count = 0
@@ -822,6 +850,10 @@ def main(page: ft.Page):
         if not expected_orders:
             return  # 静默返回，不显示错误信息
         
+        print(f"[{time.strftime('%H:%M:%S')}] 自动网格构建完成 - 期望订单数量: {len(expected_orders)}")
+        for o in expected_orders:
+            print(f"[{time.strftime('%H:%M:%S')}] 自动网格期望订单 - 方向: {o['side']}, 价格: {o['price']}, 数量: {o['qty']}, 只减仓: {o['reduceOnly']}")
+        
         # 获取当前挂单
         try:
             current_orders = trade_client.get_open_orders(state["symbol"])
@@ -849,8 +881,10 @@ def main(page: ft.Page):
             success_count = place_orders_batch(orders_to_place)
             
         if canceled_count > 0 or success_count > 0:
-            push_status(f"自动调整: 撤销 {canceled_count} 笔, 新增 {success_count} 笔")
+            push_status(f"自动调整: 撤 {canceled_count} 笔, 增 {success_count} 笔")
         refresh_data()
+
+        return orders_to_cancel, orders_to_place
 
     def check_order_differences(current_orders, expected_orders, max_interval):
         """基于价格范围的检查机制，包含去重逻辑"""
@@ -928,6 +962,7 @@ def main(page: ft.Page):
             if not found_match:
                 orders_to_place.append(expected_order)
         
+        print(f"[{time.strftime('%H:%M:%S')}] 订单差异检查 - 需要撤销: {len(orders_to_cancel)}, 需要下单: {len(orders_to_place)}")
         return orders_to_cancel, orders_to_place
 
     def cancel_specific_orders(orders_to_cancel):
@@ -935,15 +970,19 @@ def main(page: ft.Page):
         if not orders_to_cancel:
             return 0
             
+        print(f"[{time.strftime('%H:%M:%S')}] 开始撤销订单 - 订单数量: {len(orders_to_cancel)}")
         def cancel_one(order):
             try:
+                print(f"[{time.strftime('%H:%M:%S')}] 撤销订单 - 订单ID: {order.get('orderId')}, 方向: {order.get('side')}, 价格: {order.get('price')}")
                 result = trade_client.cancel_order(
                     symbol=state["symbol"],
                     orderId=order.get("orderId")
                 )
                 if result:
+                    print(f"[{time.strftime('%H:%M:%S')}] 撤销订单成功 - 订单ID: {order.get('orderId')}")
                     return True, f"撤销成功: {order.get('orderId')}"
             except Exception as e:
+                print(f"[{time.strftime('%H:%M:%S')}] 撤销订单失败 - 订单ID: {order.get('orderId')}, 错误: {str(e)}")
                 return False, f"撤销失败 {order.get('orderId')}: {str(e)}"
             return False, "撤销未知错误"
         
@@ -956,12 +995,15 @@ def main(page: ft.Page):
                     success_count += 1
                 else:
                     print(msg)
+        print(f"[{time.strftime('%H:%M:%S')}] 撤销订单完成 - 成功: {success_count}/{len(orders_to_cancel)}")
         return success_count
 
     def place_orders_batch(orders_to_place, _unused_qty_param=None):
         """批量下单"""
+        print(f"[{time.strftime('%H:%M:%S')}] 开始批量下单 - 订单数量: {len(orders_to_place)}")
         def place_one(o):
             try:
+                print(f"[{time.strftime('%H:%M:%S')}] 自动网格下单 - 交易对: {state['symbol']}, 方向: {o['side']}, 价格: {o['price']}, 数量: {o['qty']}, 只减仓: {o['reduceOnly']}")
                 res = trade_client.new_order(
                     symbol=state["symbol"],
                     side=o["side"],
@@ -972,9 +1014,14 @@ def main(page: ft.Page):
                     reduceOnly=o["reduceOnly"],
                     newOrderRespType="ACK"
                 )
-                return res and "orderId" in res
+                if res and "orderId" in res:
+                    print(f"[{time.strftime('%H:%M:%S')}] 自动网格下单成功 - 订单ID: {res.get('orderId')}, 方向: {o['side']}, 价格: {o['price']}")
+                    return True
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] 自动网格下单失败 - 响应无效, 方向: {o['side']}, 价格: {o['price']}")
+                    return False
             except Exception as e:
-                print(f"下单失败: {o['side']} @ {o['price']} - {str(e)}")
+                print(f"[{time.strftime('%H:%M:%S')}] 自动网格下单异常 - 方向: {o['side']}, 价格: {o['price']}, 错误: {str(e)}")
                 return False
 
         success_count = 0
@@ -984,6 +1031,7 @@ def main(page: ft.Page):
                 if future.result():
                     success_count += 1
         
+        print(f"[{time.strftime('%H:%M:%S')}] 批量下单完成 - 成功: {success_count}/{len(orders_to_place)}")
         return success_count
 
     # Set button click event
@@ -1033,12 +1081,15 @@ def main(page: ft.Page):
         if amt == 0:
             return notify_error("当前无持仓")
         
+        print(f"[{time.strftime('%H:%M:%S')}] 开始平仓 - 策略: {strategy}, 持仓数量: {amt}")
+        
         # 先撤销所有挂单
         try:
             trade_client.cancel_all_orders(state["symbol"])
+            print(f"[{time.strftime('%H:%M:%S')}] 已撤销所有挂单")
             push_status("已撤销所有挂单，准备平仓...")
         except Exception as e:
-            print(f"撤单失败: {e}")
+            print(f"[{time.strftime('%H:%M:%S')}] 撤单失败: {e}")
             # 即使撤单失败也继续尝试平仓
         
         side = "SELL" if amt > 0 else "BUY"
@@ -1062,10 +1113,14 @@ def main(page: ft.Page):
             params["priceMatch"] = "QUEUE"
             params["timeInForce"] = "GTX"
         
+        print(f"[{time.strftime('%H:%M:%S')}] 提交平仓订单 - 方向: {side}, 数量: {formatted_qty}, 类型: {params['type']}")
         res = trade_client.new_order(**params)
         if res:
+            print(f"[{time.strftime('%H:%M:%S')}] 平仓订单提交成功 - 订单ID: {res.get('orderId')}, 状态: {res.get('status')}")
             push_status(f"已提交平仓: {strategy} {side} {formatted_qty}")
             refresh_data()
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] 平仓订单提交失败 - 响应: {res}")
 
     close_buttons = ft.Row([
         ft.ElevatedButton("市价全平", on_click=lambda _: close_position("MARKET"), 

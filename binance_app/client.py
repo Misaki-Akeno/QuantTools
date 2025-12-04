@@ -50,7 +50,7 @@ class BinanceClient:
         url = f"{self.base_url}{endpoint}"
 
         try:
-            response = self.session.request(method, url, params=params,timeout=3)
+            response = self.session.request(method, url, params=params,timeout=1)
             response.raise_for_status()
             return response.json()
 
