@@ -14,6 +14,8 @@ PRICE_MATCH_BUTTONS = [
     {"label": "对手价5", "match_key": "OPPONENT_5", "tif": "GTC"},
     {"label": "同向价5", "match_key": "QUEUE_5", "tif": "GTX"},
 ]
+STOP_QUANTITY = 5
+STOP_LOOP = 10
 
 
 def safe_float(value, default=0.0):
@@ -60,10 +62,8 @@ def main(page: ft.Page):
 
     # Cleanup on close
     def on_close(_):
-        nonlocal auto_execution_running, auto_timer
+        nonlocal auto_execution_running
         auto_execution_running = False
-        if auto_timer:
-            auto_timer.cancel()
     
     page.on_close = on_close
 
@@ -246,7 +246,7 @@ def main(page: ft.Page):
     )
 
     # --- Tab 2: Grid Trade ---
-    gt_n_field = ft.TextField(label="单边数量", value="2", expand=True, height=40, content_padding=10, text_size=14)
+    gt_n_field = ft.TextField(label="单边数量", value="1", expand=True, height=40, content_padding=10, text_size=14)
     gt_buy_interval_field = ft.TextField(label="买入网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
     gt_sell_interval_field = ft.TextField(label="卖出网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
     gt_buy_qty_field = ft.TextField(label="买入数量", value="0.008", expand=True, height=40, content_padding=10, text_size=14)
@@ -323,7 +323,7 @@ def main(page: ft.Page):
         
         if not state["stop_loss"]["order_id"]:
             should_update = True
-        elif state["loop_count"] % 10 == 0:
+        elif state["loop_count"] % STOP_LOOP == 1:
             # Trailing logic: only update if new price is better
             if current_sl_price:
                 if pos_amt > 0 and float(formatted_stop_price) > float(current_sl_price):
@@ -331,26 +331,23 @@ def main(page: ft.Page):
                 elif pos_amt < 0 and float(formatted_stop_price) < float(current_sl_price):
                     should_update = True
         
-        if should_update:
-            # Cancel old if exists
-            if state["stop_loss"]["order_id"]:
-                try:
-                    trade_client.cancel_conditional_order(state["symbol"], strategyId=state["stop_loss"]["order_id"])
-                except Exception:
-                    pass # Ignore cancel errors
-            
+        if should_update:       
             # Place new
             try:
                 # Use a large quantity for reduceOnly to ensure full close
-                huge_qty = 999999 
                 res = trade_client.new_conditional_order(
                     symbol=state["symbol"],
                     side=side,
                     strategyType="STOP_MARKET",
                     stopPrice=formatted_stop_price,
                     reduceOnly=True,
-                    quantity=huge_qty
+                    quantity=STOP_QUANTITY
                 )
+                if state["stop_loss"]["order_id"]:
+                    try:
+                        trade_client.cancel_conditional_order(state["symbol"], strategyId=state["stop_loss"]["order_id"])
+                    except Exception:
+                        pass # Ignore cancel errors
                 if res:
                     state["stop_loss"]["order_id"] = res.get("strategyId") or res.get("orderId") # strategyId for conditional
                     state["stop_loss"]["trigger_price"] = formatted_stop_price
@@ -377,15 +374,10 @@ def main(page: ft.Page):
             triggered = True
             
         if triggered:
-            nonlocal auto_execution_running, auto_timer
+            nonlocal auto_execution_running
             auto_execution_running = False
-            if auto_timer:
-                auto_timer.cancel()
-                auto_timer = None
-            auto_toggle_btn.text = "开始自动执行"
-            auto_toggle_btn.bgcolor = Colors.GREEN_700
-            auto_toggle_btn.update()
-            push_status(f"触发止损价格 {sl_price}，自动执行已停止", success=False)
+            # UI update will be handled by the loop exit
+            push_status(f"触发止损价格 {sl_price}，正在停止自动执行...", success=False)
             return True
         return False
 
@@ -395,13 +387,9 @@ def main(page: ft.Page):
         push_status("已撤销当前交易对全部订单")
         refresh_data()
 
-    def auto_execute_grid():
-        nonlocal auto_execution_running, auto_timer
-        if not auto_execution_running:
-            return
-        
+    def run_grid_logic():
+        """Single iteration of grid logic"""
         state["loop_count"] += 1
-        
         try:
             # Manage Stop Loss
             manage_stop_loss()
@@ -414,30 +402,43 @@ def main(page: ft.Page):
         except Exception as e:
             print(f"Auto grid execution error: {e}")
             push_status(f"自动网格执行错误: {str(e)}", success=False)
+
+    def run_auto_grid_loop():
+        """Background thread loop"""
+        nonlocal auto_execution_running
         
-        # Schedule next execution
-        if auto_execution_running:
+        while auto_execution_running:
+            run_grid_logic()
+            
+            # Sleep interval with quick exit check
             interval = safe_float(gt_auto_interval_field.value)
-            if interval <= 0:
-                interval = 60  # default to 60 seconds
-            auto_timer = threading.Timer(interval, auto_execute_grid)
-            auto_timer.start()
+            if interval <= 0: interval = 1
+            
+            slept = 0
+            while slept < interval and auto_execution_running:
+                time.sleep(0.1)
+                slept += 0.1
+        
+        # Loop finished (stopped)
+        auto_toggle_btn.text = "开始自动执行"
+        auto_toggle_btn.bgcolor = Colors.GREEN_700
+        auto_toggle_btn.disabled = False
+        auto_toggle_btn.update()
+        push_status("自动网格执行已停止")
 
     @ui_error_handler
     def toggle_auto_execution(_):
-        nonlocal auto_execution_running, auto_timer
+        nonlocal auto_execution_running
         
         if auto_execution_running:
-            # 停止自动执行
+            # Request stop
             auto_execution_running = False
-            if auto_timer:
-                auto_timer.cancel()
-                auto_timer = None
-            auto_toggle_btn.text = "开始自动执行"
-            auto_toggle_btn.bgcolor = Colors.GREEN_700
-            push_status("已停止自动网格执行")
+            auto_toggle_btn.text = "正在停止..."
+            auto_toggle_btn.bgcolor = Colors.GREY_700
+            auto_toggle_btn.disabled = True
+            auto_toggle_btn.update()
         else:
-            # 开始自动执行
+            # Start
             interval = safe_float(gt_auto_interval_field.value)
             if interval <= 0:
                 return notify_error("间隔秒数必须大于0")
@@ -445,10 +446,11 @@ def main(page: ft.Page):
             auto_execution_running = True
             auto_toggle_btn.text = "停止自动执行"
             auto_toggle_btn.bgcolor = Colors.RED_700
+            auto_toggle_btn.update()
             push_status(f"开始自动网格执行，每{interval}秒执行一次")
-            auto_execute_grid()
-        
-        auto_toggle_btn.update()
+            
+            # Start background thread
+            threading.Thread(target=run_auto_grid_loop, daemon=True).start()
 
     @ui_error_handler
     def gt_place_grid(_):
