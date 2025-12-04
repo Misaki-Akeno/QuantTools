@@ -44,7 +44,7 @@ def main(page: ft.Page):
     page.horizontal_alignment = "stretch"
     page.window.always_on_top = True
     page.window.width = 335
-    page.window.height = 660
+    page.window.height = 700
     page.theme_mode = ft.ThemeMode.DARK
     page.fonts = {
         "Maple": "fonts/MapleMono-NF-CN-Regular.ttf",
@@ -80,7 +80,9 @@ def main(page: ft.Page):
         "filters": {
             "tick_size": "0.01",
             "step_size": "0.001"
-        }
+        },
+        "stop_loss": {"order_id": None, "trigger_price": None},
+        "loop_count": 0
     }
 
     # --- UI Components ---
@@ -245,11 +247,13 @@ def main(page: ft.Page):
 
     # --- Tab 2: Grid Trade ---
     gt_n_field = ft.TextField(label="单边数量", value="2", expand=True, height=40, content_padding=10, text_size=14)
-    gt_interval_field = ft.TextField(label="网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
+    gt_buy_interval_field = ft.TextField(label="买入网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
+    gt_sell_interval_field = ft.TextField(label="卖出网格间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
     gt_buy_qty_field = ft.TextField(label="买入数量", value="0.008", expand=True, height=40, content_padding=10, text_size=14)
     gt_sell_qty_field = ft.TextField(label="卖出数量", value="0.008", expand=True, height=40, content_padding=10, text_size=14)
     gt_base_price_field = ft.TextField(label="基准价格", value="", expand=True, height=40, content_padding=10, text_size=14, hint_text="留空=动态基准")
-    gt_auto_interval_field = ft.TextField(label="自动间隔", value="1", expand=True, height=40, content_padding=10, text_size=14)
+    gt_stop_loss_field = ft.TextField(label="止损(%)", value="1", expand=True, height=40, content_padding=10, text_size=14)
+    gt_auto_interval_field = ft.TextField(label="自动间隔", value="0.5", expand=True, height=40, content_padding=10, text_size=14)
     
     gt_strategy_radio = ft.RadioGroup(
         content=ft.Row([
@@ -270,6 +274,121 @@ def main(page: ft.Page):
         bgcolor=Colors.GREEN_700
     )
     
+    def manage_stop_loss():
+        """Manage stop loss orders: place, update (trailing), or cancel"""
+        sl_pct_str = gt_stop_loss_field.value.strip()
+        if not sl_pct_str:
+            return
+
+        try:
+            sl_pct = float(sl_pct_str)
+        except ValueError:
+            return # Invalid input, ignore
+
+        if sl_pct <= 0:
+            return
+
+        # Check if we have a position
+        if not state.get("position"):
+            return
+        
+        pos_amt = safe_float(state["position"].get("positionAmt"))
+        if pos_amt == 0:
+            # No position, cancel existing stop loss if any
+            if state["stop_loss"]["order_id"]:
+                try:
+                    trade_client.cancel_conditional_order(state["symbol"], strategyId=state["stop_loss"]["order_id"])
+                    push_status("空仓，已撤销止损单")
+                except Exception as e:
+                    print(f"Failed to cancel SL: {e}")
+                state["stop_loss"] = {"order_id": None, "trigger_price": None}
+            return
+
+        entry_price = safe_float(state["position"].get("entryPrice"))
+        tick_size = state["filters"]["tick_size"]
+        
+        # Calculate new stop price
+        if pos_amt > 0: # LONG
+            new_stop_price = entry_price * (1 - sl_pct / 100)
+            side = "SELL"
+        else: # SHORT
+            new_stop_price = entry_price * (1 + sl_pct / 100)
+            side = "BUY"
+            
+        formatted_stop_price = format_price(new_stop_price, tick_size)
+        
+        # Check if we need to update (every 10 cycles or if no order)
+        should_update = False
+        current_sl_price = state["stop_loss"]["trigger_price"]
+        
+        if not state["stop_loss"]["order_id"]:
+            should_update = True
+        elif state["loop_count"] % 10 == 0:
+            # Trailing logic: only update if new price is better
+            if current_sl_price:
+                if pos_amt > 0 and float(formatted_stop_price) > float(current_sl_price):
+                    should_update = True
+                elif pos_amt < 0 and float(formatted_stop_price) < float(current_sl_price):
+                    should_update = True
+        
+        if should_update:
+            # Cancel old if exists
+            if state["stop_loss"]["order_id"]:
+                try:
+                    trade_client.cancel_conditional_order(state["symbol"], strategyId=state["stop_loss"]["order_id"])
+                except Exception:
+                    pass # Ignore cancel errors
+            
+            # Place new
+            try:
+                # Use a large quantity for reduceOnly to ensure full close
+                huge_qty = 999999 
+                res = trade_client.new_conditional_order(
+                    symbol=state["symbol"],
+                    side=side,
+                    strategyType="STOP_MARKET",
+                    stopPrice=formatted_stop_price,
+                    reduceOnly=True,
+                    quantity=huge_qty
+                )
+                if res:
+                    state["stop_loss"]["order_id"] = res.get("strategyId") or res.get("orderId") # strategyId for conditional
+                    state["stop_loss"]["trigger_price"] = formatted_stop_price
+                    push_status(f"止损单已更新: {formatted_stop_price}")
+            except Exception as e:
+                print(f"Failed to place SL: {e}")
+                notify_error(f"止损下单失败: {e}")
+
+    def check_stop_loss_termination():
+        """Check if price hit stop loss level, if so, stop auto execution"""
+        if not state["stop_loss"]["trigger_price"]:
+            return False
+            
+        current_price = safe_float(state["ticker"]["price"]) if state["ticker"] else 0
+        if current_price == 0: return False
+        
+        sl_price = float(state["stop_loss"]["trigger_price"])
+        pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0
+        
+        triggered = False
+        if pos_amt > 0 and current_price <= sl_price:
+            triggered = True
+        elif pos_amt < 0 and current_price >= sl_price:
+            triggered = True
+            
+        if triggered:
+            nonlocal auto_execution_running, auto_timer
+            auto_execution_running = False
+            if auto_timer:
+                auto_timer.cancel()
+                auto_timer = None
+            auto_toggle_btn.text = "开始自动执行"
+            auto_toggle_btn.bgcolor = Colors.GREEN_700
+            auto_toggle_btn.update()
+            push_status(f"触发止损价格 {sl_price}，自动执行已停止", success=False)
+            return True
+        return False
+
     @ui_error_handler
     def gt_cancel_grid(_):
         trade_client.cancel_all_orders(state["symbol"])
@@ -281,7 +400,16 @@ def main(page: ft.Page):
         if not auto_execution_running:
             return
         
+        state["loop_count"] += 1
+        
         try:
+            # Manage Stop Loss
+            manage_stop_loss()
+            
+            # Check Termination
+            if check_stop_loss_termination():
+                return
+
             gt_place_grid_auto()  # 使用专用的自动网格函数
         except Exception as e:
             print(f"Auto grid execution error: {e}")
@@ -327,13 +455,14 @@ def main(page: ft.Page):
         # 1. Validate Inputs
         try:
             n = int(gt_n_field.value)
-            interval = float(gt_interval_field.value)
+            interval_buy = float(gt_buy_interval_field.value)
+            interval_sell = float(gt_sell_interval_field.value)
             buy_qty = float(gt_buy_qty_field.value)
             sell_qty = float(gt_sell_qty_field.value)
         except ValueError:
             return notify_error("输入参数无效")
 
-        if n <= 0 or interval <= 0 or buy_qty < 0 or sell_qty < 0:
+        if n <= 0 or interval_buy <= 0 or interval_sell <= 0 or buy_qty < 0 or sell_qty < 0:
             return notify_error("参数不能为负数，单边数量和网格间隔必须大于0")
 
         gt_cancel_grid(None)
@@ -353,11 +482,12 @@ def main(page: ft.Page):
         strategy = gt_strategy_radio.value
         pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0.0
 
-        d_interval = Decimal(str(interval))
+        d_interval_buy = Decimal(str(interval_buy))
+        d_interval_sell = Decimal(str(interval_sell))
         d_current_price = Decimal(str(current_price))
         
-        # Calculate base grid
-        base_grid = (d_current_price / d_interval).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_interval
+        # Calculate base grid using buy interval for consistency
+        base_grid = (d_current_price / d_interval_buy).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_interval_buy
         
         orders_to_place = []
         tick_size = state["filters"]["tick_size"]
@@ -372,7 +502,7 @@ def main(page: ft.Page):
                 i = 1  # 从1开始，避免当前价格
                 formatted_buy_qty = format_qty(buy_qty, step_size)
                 while count < n:
-                    p = base_grid - (Decimal(i) * d_interval)
+                    p = base_grid - (Decimal(i) * d_interval_buy)
                     if p < d_current_price:
                         orders_to_place.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": False, "qty": formatted_buy_qty})
                         count += 1
@@ -386,7 +516,7 @@ def main(page: ft.Page):
                 formatted_sell_qty = format_qty(sell_qty, step_size)
                 max_sell_orders = min(n, int(pos_amt / sell_qty))  # 限制平仓单数量
                 while count < max_sell_orders:
-                    p = base_grid + (Decimal(i) * d_interval)
+                    p = base_grid + (Decimal(i) * d_interval_sell)
                     if p > d_current_price:
                         orders_to_place.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": True, "qty": formatted_sell_qty})
                         count += 1
@@ -401,7 +531,7 @@ def main(page: ft.Page):
                 i = 1  # 从1开始，避免当前价格
                 formatted_sell_qty = format_qty(sell_qty, step_size)
                 while count < n:
-                    p = base_grid + (Decimal(i) * d_interval)
+                    p = base_grid + (Decimal(i) * d_interval_sell)
                     if p > d_current_price:
                         orders_to_place.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": False, "qty": formatted_sell_qty})
                         count += 1
@@ -415,7 +545,7 @@ def main(page: ft.Page):
                 formatted_buy_qty = format_qty(buy_qty, step_size)
                 max_buy_orders = min(n, int(abs(pos_amt) / buy_qty))  # 限制平仓单数量
                 while count < max_buy_orders:
-                    p = base_grid - (Decimal(i) * d_interval)
+                    p = base_grid - (Decimal(i) * d_interval_buy)
                     if p < d_current_price:
                         orders_to_place.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": True, "qty": formatted_buy_qty})
                         count += 1
@@ -435,7 +565,7 @@ def main(page: ft.Page):
                 count = 0
                 i = 1
                 while count < n:
-                    p = base_grid + (Decimal(i) * d_interval)
+                    p = base_grid + (Decimal(i) * d_interval_sell)
                     if p > d_current_price:
                         orders_to_place.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": sell_reduce_only, "qty": formatted_sell_qty})
                         count += 1
@@ -447,7 +577,7 @@ def main(page: ft.Page):
                 count = 0
                 i = 1
                 while count < n:
-                    p = base_grid - (Decimal(i) * d_interval)
+                    p = base_grid - (Decimal(i) * d_interval_buy)
                     if p < d_current_price:
                         orders_to_place.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": buy_reduce_only, "qty": formatted_buy_qty})
                         count += 1
@@ -493,13 +623,14 @@ def main(page: ft.Page):
         # 1. Validate Inputs
         try:
             n = int(gt_n_field.value)
-            interval = float(gt_interval_field.value)
+            interval_buy = float(gt_buy_interval_field.value)
+            interval_sell = float(gt_sell_interval_field.value)
             buy_qty = float(gt_buy_qty_field.value)
             sell_qty = float(gt_sell_qty_field.value)
         except ValueError:
             return notify_error("输入参数无效")
 
-        if n <= 0 or interval <= 0 or buy_qty < 0 or sell_qty < 0:
+        if n <= 0 or interval_buy <= 0 or interval_sell <= 0 or buy_qty < 0 or sell_qty < 0:
             return notify_error("参数不能为负数，单边数量和网格间隔必须大于0")
 
         # 获取基准价格（如果指定了固定价格就不需要刷新市场数据）
@@ -517,14 +648,18 @@ def main(page: ft.Page):
         strategy = gt_strategy_radio.value
         pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0.0
 
-        d_interval = Decimal(str(interval))
+        d_interval_buy = Decimal(str(interval_buy))
+        d_interval_sell = Decimal(str(interval_sell))
         d_current_price = Decimal(str(current_price))
         
-        # Calculate base grid
-        base_grid = (d_current_price / d_interval).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_interval
+        # Calculate base grid using buy interval for consistency
+        base_grid = (d_current_price / d_interval_buy).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * d_interval_buy
         
         tick_size = state["filters"]["tick_size"]
         step_size = state["filters"]["step_size"]
+        
+        # Stop Loss Filter
+        sl_price = float(state["stop_loss"]["trigger_price"]) if state["stop_loss"]["trigger_price"] else None
 
         # 计算期望的订单列表 (使用与gt_place_grid相同的逻辑)
         expected_orders = []
@@ -537,7 +672,13 @@ def main(page: ft.Page):
                 i = 1
                 formatted_buy_qty = format_qty(buy_qty, step_size)
                 while count < n:
-                    p = base_grid - (Decimal(i) * d_interval)
+                    p = base_grid - (Decimal(i) * d_interval_buy)
+                    
+                    # Filter: Don't buy below stop loss (for LONG)
+                    if sl_price and float(p) <= sl_price:
+                         i += 1
+                         continue
+                         
                     if p < d_current_price:
                         expected_orders.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": False, "qty": formatted_buy_qty})
                         count += 1
@@ -551,7 +692,7 @@ def main(page: ft.Page):
                 formatted_sell_qty = format_qty(sell_qty, step_size)
                 max_sell_orders = min(n, int(pos_amt / sell_qty))
                 while count < max_sell_orders:
-                    p = base_grid + (Decimal(i) * d_interval)
+                    p = base_grid + (Decimal(i) * d_interval_sell)
                     if p > d_current_price:
                         expected_orders.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": True, "qty": formatted_sell_qty})
                         count += 1
@@ -566,7 +707,13 @@ def main(page: ft.Page):
                 i = 1
                 formatted_sell_qty = format_qty(sell_qty, step_size)
                 while count < n:
-                    p = base_grid + (Decimal(i) * d_interval)
+                    p = base_grid + (Decimal(i) * d_interval_sell)
+                    
+                    # Filter: Don't sell above stop loss (for SHORT)
+                    if sl_price and float(p) >= sl_price:
+                         i += 1
+                         continue
+
                     if p > d_current_price:
                         expected_orders.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": False, "qty": formatted_sell_qty})
                         count += 1
@@ -580,7 +727,7 @@ def main(page: ft.Page):
                 formatted_buy_qty = format_qty(buy_qty, step_size)
                 max_buy_orders = min(n, int(abs(pos_amt) / buy_qty))
                 while count < max_buy_orders:
-                    p = base_grid - (Decimal(i) * d_interval)
+                    p = base_grid - (Decimal(i) * d_interval_buy)
                     if p < d_current_price:
                         expected_orders.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": True, "qty": formatted_buy_qty})
                         count += 1
@@ -598,7 +745,15 @@ def main(page: ft.Page):
                 count = 0
                 i = 1
                 while count < n:
-                    p = base_grid + (Decimal(i) * d_interval)
+                    p = base_grid + (Decimal(i) * d_interval_sell)
+                    
+                    # Filter: Don't sell above stop loss (if SHORT bias or just safety)
+                    # For Neutral, if we have position, we might want to respect stop loss too.
+                    # If pos_amt < 0 (Short), stop loss is above.
+                    if pos_amt < 0 and sl_price and float(p) >= sl_price:
+                        i += 1
+                        continue
+                    
                     if p > d_current_price:
                         expected_orders.append({"price": format_price(p, tick_size), "side": "SELL", "reduceOnly": sell_reduce_only, "qty": formatted_sell_qty})
                         count += 1
@@ -610,7 +765,14 @@ def main(page: ft.Page):
                 count = 0
                 i = 1
                 while count < n:
-                    p = base_grid - (Decimal(i) * d_interval)
+                    p = base_grid - (Decimal(i) * d_interval_buy)
+                    
+                    # Filter: Don't buy below stop loss (if LONG bias or just safety)
+                    # If pos_amt > 0 (Long), stop loss is below.
+                    if pos_amt > 0 and sl_price and float(p) <= sl_price:
+                        i += 1
+                        continue
+
                     if p < d_current_price:
                         expected_orders.append({"price": format_price(p, tick_size), "side": "BUY", "reduceOnly": buy_reduce_only, "qty": formatted_buy_qty})
                         count += 1
@@ -630,7 +792,7 @@ def main(page: ft.Page):
             current_orders = []
         
         # 检查哪些订单需要操作
-        orders_to_cancel, orders_to_place = check_order_differences(current_orders, expected_orders, None)
+        orders_to_cancel, orders_to_place = check_order_differences(current_orders, expected_orders, max(interval_buy, interval_sell))
         
         if not orders_to_cancel and not orders_to_place:
             # push_status("网格订单已是最新状态，无需调整")
@@ -650,7 +812,7 @@ def main(page: ft.Page):
             push_status(f"自动调整: 撤销 {canceled_count} 笔, 新增 {success_count} 笔")
         refresh_data()
 
-    def check_order_differences(current_orders, expected_orders, _unused_qty_param=None):
+    def check_order_differences(current_orders, expected_orders, max_interval):
         """基于价格范围的检查机制，包含去重逻辑"""
         if not expected_orders:
             return current_orders, []  # 没有期望订单，撤销所有当前订单
@@ -661,9 +823,8 @@ def main(page: ft.Page):
         max_expected_price = max(expected_prices)
         
         # 扩展容忍范围：向两边各扩展一个网格间隔
-        interval = Decimal(str(gt_interval_field.value))
-        price_range_min = min_expected_price - interval
-        price_range_max = max_expected_price + interval
+        price_range_min = min_expected_price - Decimal(str(max_interval))
+        price_range_max = max_expected_price + Decimal(str(max_interval))
         
         # 获取当前的买入和卖出数量设置（用于识别网格单）
         step_size = state["filters"]["step_size"]
@@ -790,9 +951,10 @@ def main(page: ft.Page):
     
     tab_grid = ft.Container(
         content=ft.Column([
-            ft.Row([gt_n_field, gt_interval_field]),
+            ft.Row([gt_buy_interval_field, gt_sell_interval_field]),
             ft.Row([gt_buy_qty_field, gt_sell_qty_field]),
-            ft.Row([gt_base_price_field, gt_auto_interval_field]),
+            ft.Row([gt_n_field, gt_base_price_field]),
+            ft.Row([gt_stop_loss_field, gt_auto_interval_field]),
             ft.Container(content=gt_strategy_radio, padding=ft.padding.only(bottom=5)),
             ft.Row([
                 ft.ElevatedButton("执行网格挂单", on_click=gt_place_grid, expand=True, color=Colors.WHITE, bgcolor=Colors.BLUE_700),
