@@ -332,16 +332,30 @@ def main(page: ft.Page):
                     should_update = True
         
         if should_update:       
+            # Calculate stop quantity dynamically
+            try:
+                equity = safe_float(state["account"].get("accountEquity")) if state.get("account") else 0
+                current_price = safe_float(state["ticker"]["price"]) if state["ticker"] else 0
+                if equity > 0 and current_price > 0:
+                    calc_qty = equity / current_price * 100
+                    pos_amt = safe_float(state["position"].get("positionAmt")) if state["position"] else 0
+                    stop_quantity = format_qty(max(calc_qty, abs(pos_amt)*2), state["filters"]["step_size"])
+                else:
+                    stop_quantity = format_qty(STOP_QUANTITY, state["filters"]["step_size"])
+            except Exception as e:
+                print(f"Failed to calculate stop quantity: {e}")
+                stop_quantity = format_qty(STOP_QUANTITY, state["filters"]["step_size"])
+            
             # Place new
             try:
-                # Use a large quantity for reduceOnly to ensure full close
+                # Use calculated quantity for reduceOnly to ensure full close if needed
                 res = trade_client.new_conditional_order(
                     symbol=state["symbol"],
                     side=side,
                     strategyType="STOP_MARKET",
                     stopPrice=formatted_stop_price,
                     reduceOnly=True,
-                    quantity=STOP_QUANTITY
+                    quantity=stop_quantity
                 )
                 if state["stop_loss"]["order_id"]:
                     try:
