@@ -82,6 +82,7 @@ def main(page: ft.Page):
             "step_size": "0.001"
         },
         "stop_loss": {"order_id": None, "trigger_price": None},
+        "trailing": {"side": None, "high": None, "low": None},
         "loop_count": 0
     }
 
@@ -302,17 +303,40 @@ def main(page: ft.Page):
                 except Exception as e:
                     print(f"Failed to cancel SL: {e}")
                 state["stop_loss"] = {"order_id": None, "trigger_price": None}
+            state["trailing"] = {"side": None, "high": None, "low": None}
             return
 
-        entry_price = safe_float(state["position"].get("entryPrice"))
+        current_price = safe_float(state["ticker"]["price"]) if state["ticker"] else 0
+        if current_price <= 0:
+            return
+
+        trail = state.get("trailing") or {"side": None, "high": None, "low": None}
+        current_side = "LONG" if pos_amt > 0 else "SHORT"
+        if trail["side"] != current_side:
+            # Position opened or direction flipped: reset tracking window
+            trail = {"side": current_side, "high": current_price, "low": current_price}
+        else:
+            if current_side == "LONG":
+                if trail["high"] is None or current_price > trail["high"]:
+                    trail["high"] = current_price
+            else:
+                if trail["low"] is None or current_price < trail["low"]:
+                    trail["low"] = current_price
+
+        state["trailing"] = trail
+
+        # Use highest/lowest since entry to trail stop
+        base_stop_ref = trail["high"] if current_side == "LONG" else trail["low"]
+        if base_stop_ref is None:
+            base_stop_ref = current_price
         tick_size = state["filters"]["tick_size"]
         
         # Calculate new stop price
         if pos_amt > 0: # LONG
-            new_stop_price = entry_price * (1 - sl_pct / 100)
+            new_stop_price = base_stop_ref * (1 - sl_pct / 100)
             side = "SELL"
         else: # SHORT
-            new_stop_price = entry_price * (1 + sl_pct / 100)
+            new_stop_price = base_stop_ref * (1 + sl_pct / 100)
             side = "BUY"
             
         formatted_stop_price = format_price(new_stop_price, tick_size)
@@ -995,6 +1019,13 @@ def main(page: ft.Page):
     # --- Close Position Controls ---
     @ui_error_handler
     def close_position(strategy: str):
+        nonlocal auto_execution_running
+        if auto_execution_running:
+            auto_execution_running = False
+            auto_toggle_btn.text = "正在停止..."
+            auto_toggle_btn.bgcolor = Colors.GREY_700
+            auto_toggle_btn.disabled = True
+            auto_toggle_btn.update()
         if not state.get("position"):
             return notify_error("未获取到持仓信息，请先刷新")
         
